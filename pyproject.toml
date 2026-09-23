@@ -1,0 +1,90 @@
+[project]
+name = "agent-hub"
+version = "0.1.0"
+description = "Telegram forum topics as AI agent sessions"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "python-telegram-bot>=22.0,<23",
+]
+
+[project.scripts]
+agent-hub = "agent_hub.__main__:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.16",
+    "pre-commit>=4.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",       # docstrings only where they explain a non-obvious why
+    "CPY",     # no per-file copyright headers
+    "COM812",  # conflicts with the formatter
+    "TRY003",  # exception messages carry the offending value
+    "EM101",
+    "EM102",
+    "RUF001",  # Russian UI strings trip the ambiguous-unicode checks
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004"]
+
+[tool.ruff.lint.flake8-type-checking]
+strict = true
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+mypy_path = "src"
+files = ["src", "tests"]
+warn_unreachable = true
+extra_checks = true
+enable_error_code = [
+    "deprecated",
+    "exhaustive-match",
+    "explicit-override",
+    "ignore-without-code",
+    "mutable-override",
+    "possibly-undefined",
+    "redundant-expr",
+    "redundant-self",
+    "truthy-bool",
+    "truthy-iterable",
+    "unimported-reveal",
+    "unused-awaitable",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+xfail_strict = true
+filterwarnings = ["error"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+branch = true
+source = ["agent_hub"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
