@@ -27,6 +27,7 @@ Telegram (форум-группа)
 - [Быстрый старт](#быстрый-старт)
 - [Использование](#использование)
 - [Конфигурация](#конфигурация)
+- [Запуск в Docker](#запуск-в-docker)
 - [Запуск в фоне (systemd)](#запуск-в-фоне-systemd)
 - [Безопасность](#безопасность)
 - [Как это устроено](#как-это-устроено)
@@ -38,7 +39,7 @@ Telegram (форум-группа)
 | Что | Зачем |
 |---|---|
 | Linux или macOS | Там, где будет работать агент |
-| [uv](https://docs.astral.sh/uv/) | Установка зависимостей и запуск; Python 3.12+ uv поставит сам |
+| [uv](https://docs.astral.sh/uv/) **или** Docker с Compose | Запуск на хосте (Python 3.12+ uv поставит сам) или [в контейнере](#запуск-в-docker) |
 | [Claude Code](https://code.claude.com/docs/en/setup), выполненный вход (`claude` → `/login`) или `ANTHROPIC_API_KEY` | SDK запускает Claude Code и берёт его авторизацию |
 | Telegram-аккаунт | Создать бота и группу |
 
@@ -192,6 +193,106 @@ uv run pytest tests/test_orders.py
 | `plan` | Только чтение и план, без изменений |
 | `bypassPermissions` | Без подтверждений вообще. Только в изолированном окружении |
 
+## Запуск в Docker
+
+Образ содержит Python, `git`, `ssh`, `curl` и Claude Code (он поставляется вместе с SDK,
+Node.js не нужен). Директория хоста монтируется в контейнер как `/workspace` — это и есть
+корень рабочих директорий для всех тем.
+
+### 1. Настройте `.env`
+
+Заполните обязательные переменные из [Конфигурации](#конфигурация) и добавьте:
+
+```dotenv
+# что смонтировать как /workspace
+AGENT_HUB_HOST_WORKSPACE=/home/you/Projects
+# ваш `id -u` и `id -g` — чтобы файлы в /workspace принадлежали вам
+AGENT_HUB_UID=1000
+AGENT_HUB_GID=1000
+```
+
+`AGENT_HUB_WORKSPACE_ROOT` и `AGENT_HUB_STATE_FILE` в контейнере переопределяются на
+`/workspace` и `/data/topics.json`, поэтому один `.env` подходит и для хоста, и для Docker.
+Пути в командах бота считаются от `/workspace`: при `AGENT_HUB_HOST_WORKSPACE=/home/you/Projects`
+команда `/cwd shop/backend` откроет `/home/you/Projects/shop/backend`.
+
+### 2. Соберите образ
+
+```bash
+docker compose build
+```
+
+### 3. Авторизуйте Claude
+
+Один из вариантов:
+
+- **Вход по подписке внутри контейнера** — выполняется один раз, данные сохраняются в томе
+  `claude`:
+
+  ```bash
+  docker compose run --rm -it --entrypoint claude agent-hub
+  # в Claude Code: /login, после входа — /exit
+  ```
+
+- **API-ключ:** `ANTHROPIC_API_KEY=sk-ant-...` в `.env`.
+- **Долгоживущий токен подписки:** выполните `claude setup-token` на хосте и положите результат
+  в `CLAUDE_CODE_OAUTH_TOKEN` в `.env`.
+
+### 4. Запустите
+
+```bash
+docker compose up -d
+docker compose logs -f
+```
+
+ID группы и пользователя узнаются так же, как в [шаге 4](#4-узнайте-id-группы-и-свой-user-id)
+быстрого старта — строки `rejected update` будут в `docker compose logs`.
+
+Управление:
+
+```bash
+docker compose restart          # после правки .env
+docker compose down             # остановить; тома с состоянием и логином сохраняются
+docker compose build && docker compose up -d   # после обновления кода
+```
+
+### Что где хранится
+
+| Путь в контейнере | Откуда | Содержимое |
+|---|---|---|
+| `/workspace` | `AGENT_HUB_HOST_WORKSPACE` (bind mount) | Ваши проекты, с ними работает агент |
+| `/data` | том `data` | `topics.json` — привязка тем к сессиям |
+| `/home/app/.claude` | том `claude` | Логин, настройки и история сессий Claude Code |
+
+### Особенности
+
+- **Инструменты.** В образе только Python и git. Если агенту нужны `node`, `mvn`, `go` и
+  т. п., унаследуйте образ и доустановите их:
+
+  ```dockerfile
+  FROM agent-hub:local
+  USER root
+  RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+      && rm -rf /var/lib/apt/lists/*
+  USER app
+  ```
+
+- **Настройки Claude Code.** Контейнер не видит ваш `~/.claude` на хосте: у него свои
+  `settings.json` и `CLAUDE.md` в томе `claude`. Проектные `.claude/settings.json` и `CLAUDE.md`
+  внутри `/workspace` подхватываются как обычно. Монтировать весь `~/.claude` с хоста не
+  стоит — хуки и плагины там часто ссылаются на пути хоста.
+- **Git от вашего имени.** Чтобы агент мог коммитить и пушить, добавьте в `compose.yaml`
+  в `volumes` (только чтение):
+
+  ```yaml
+      - ~/.gitconfig:/home/app/.gitconfig:ro
+      - ~/.ssh:/home/app/.ssh:ro
+  ```
+
+- **Изоляция.** Контейнер видит только `/workspace`, а не весь домашний каталог. Это заметно
+  безопаснее запуска на хосте, но внутри `/workspace` агент может всё, что разрешено его
+  режимом.
+
 ## Запуск в фоне (systemd)
 
 Юнит пользовательского systemd лежит в [`deploy/agent-hub.service`](deploy/agent-hub.service).
@@ -237,7 +338,7 @@ systemctl --user restart agent-hub
 
 - Храните `.env` с правами `600`, не коммитьте его (он в `.gitignore`).
 - Не используйте `bypassPermissions` на рабочей машине. Если нужна полная автономия —
-  запускайте бота в контейнере или VM с доступом только к нужным репозиториям.
+  запускайте бота [в Docker](#запуск-в-docker), смонтировав только нужные репозитории.
 - При утечке токена: `@BotFather` → `/revoke`, затем обновите `.env`.
 - Не добавляйте в группу посторонних: allowlist защищает от их команд, но они будут видеть
   переписку и вывод агента.

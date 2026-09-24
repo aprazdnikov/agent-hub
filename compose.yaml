@@ -1,0 +1,22 @@
+services:
+  agent-hub:
+    build:
+      context: .
+      args:
+        UID: ${AGENT_HUB_UID:-1000}
+        GID: ${AGENT_HUB_GID:-1000}
+    image: agent-hub:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Paths inside the container; they override host paths from .env.
+      AGENT_HUB_WORKSPACE_ROOT: /workspace
+      AGENT_HUB_STATE_FILE: /data/topics.json
+    volumes:
+      - ${AGENT_HUB_HOST_WORKSPACE:?set AGENT_HUB_HOST_WORKSPACE in .env to the host directory for /workspace}:/workspace
+      - data:/data
+      - claude:/home/app/.claude
+
+volumes:
+  data:
+  claude:

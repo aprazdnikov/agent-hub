@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.venv
+.env
+.env.*
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+tests
+deploy
