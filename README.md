@@ -195,9 +195,17 @@ uv run pytest tests/test_orders.py
 
 ## Запуск в Docker
 
-Образ содержит Python, `git`, `ssh`, `curl` и Claude Code (он поставляется вместе с SDK,
-Node.js не нужен). Директория хоста монтируется в контейнер как `/workspace` — это и есть
-корень рабочих директорий для всех тем.
+Директория хоста монтируется в контейнер как `/workspace` — это и есть корень рабочих
+директорий для всех тем. Есть два варианта образа, выбираются `AGENT_HUB_IMAGE` в `.env`:
+
+| Вариант | Что внутри | Для чего |
+|---|---|---|
+| `base` (по умолчанию) | Python 3.12, git, ssh, curl, Claude Code | Python, скрипты, документация |
+| `dev` | `base` + JDK 25, Maven 3.9, Node.js 24, npm, Docker CLI | Java/Maven и JavaScript-проекты |
+
+Claude Code поставляется вместе с SDK, отдельный Node.js для него не нужен. Версии
+инструментов `dev` меняются аргументами сборки `JAVA_VERSION`, `MAVEN_VERSION`,
+`NODE_VERSION`, `DOCKER_VERSION` в [`Dockerfile`](Dockerfile).
 
 ### 1. Настройте `.env`
 
@@ -209,6 +217,10 @@ AGENT_HUB_HOST_WORKSPACE=/home/you/Projects
 # ваш `id -u` и `id -g` — чтобы файлы в /workspace принадлежали вам
 AGENT_HUB_UID=1000
 AGENT_HUB_GID=1000
+# для Java/Node-проектов
+AGENT_HUB_IMAGE=dev
+# переиспользовать локальный Maven-репозиторий хоста (иначе — отдельный том m2)
+AGENT_HUB_HOST_M2=/home/you/.m2
 ```
 
 `AGENT_HUB_WORKSPACE_ROOT` и `AGENT_HUB_STATE_FILE` в контейнере переопределяются на
@@ -263,16 +275,45 @@ docker compose build && docker compose up -d   # после обновления
 | `/workspace` | `AGENT_HUB_HOST_WORKSPACE` (bind mount) | Ваши проекты, с ними работает агент |
 | `/data` | том `data` | `topics.json` — привязка тем к сессиям |
 | `/home/app/.claude` | том `claude` | Логин, настройки и история сессий Claude Code |
+| `/home/app/.m2` | `AGENT_HUB_HOST_M2` или том `m2` | Локальный Maven-репозиторий |
+| `/home/app/.npm` | `AGENT_HUB_HOST_NPM` или том `npm` | Кеш npm |
+
+Монтирование `~/.m2` хоста полезно, когда в нём есть артефакты, которых нет в публичных
+репозиториях (собранные локально внутренние библиотеки), и чтобы не качать зависимости заново.
+
+### Docker внутри агента (Testcontainers)
+
+Интеграционные тесты на Testcontainers или `docker compose` требуют Docker. Файл
+[`compose.docker.yaml`](compose.docker.yaml) даёт агенту доступ к Docker хоста: монтирует
+сокет, добавляет группу `docker`, направляет Testcontainers на хост через
+`host.docker.internal` и монтирует рабочую директорию **по тому же пути, что на хосте** —
+демон разрешает пути bind-mount на хосте, поэтому `/workspace` для этого не подходит.
+
+> ⚠️ Доступ к Docker-сокету равен правам root на хосте: агент может запустить контейнер,
+> смонтировав в него любую директорию. Включайте, только если нужны такие тесты, и держите
+> `AGENT_HUB_CLAUDE_PERMISSION_MODE=default`, чтобы каждая команда шла через подтверждение.
+
+Включение — в `.env`:
+
+```dotenv
+AGENT_HUB_IMAGE=dev
+AGENT_HUB_DOCKER_GID=999          # getent group docker | cut -d: -f3
+COMPOSE_FILE=compose.yaml:compose.docker.yaml
+```
+
+`COMPOSE_FILE` подключает оба файла, поэтому команды остаются прежними —
+`docker compose build`, `docker compose up -d`. Корень рабочих директорий в этом режиме
+совпадает с путём на хосте, например `/home/you/Projects`, а не `/workspace`.
 
 ### Особенности
 
-- **Инструменты.** В образе только Python и git. Если агенту нужны `node`, `mvn`, `go` и
-  т. п., унаследуйте образ и доустановите их:
+- **Другие инструменты.** Если не хватает того, что есть в `dev` (`go`, `gradle`, `psql` и
+  т. п.), унаследуйте образ и доустановите:
 
   ```dockerfile
-  FROM agent-hub:local
+  FROM agent-hub:dev
   USER root
-  RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+  RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client \
       && rm -rf /var/lib/apt/lists/*
   USER app
   ```

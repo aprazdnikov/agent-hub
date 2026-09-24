@@ -28,9 +28,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t agent-hub:ci .
+      - run: docker build --target base -t agent-hub:ci .
       - name: Image starts and rejects empty config
         run: |
           out=$(docker run --rm agent-hub:ci 2>&1) && exit 1
           echo "$out" | grep -q "AGENT_HUB_TELEGRAM_TOKEN is required"
       - run: docker run --rm --entrypoint claude agent-hub:ci --version
+      - run: docker build --target dev -t agent-hub:ci-dev .
+      - name: Dev image has the toolchains
+        run: >-
+          docker run --rm --entrypoint sh agent-hub:ci-dev -c
+          'java -version && mvn -v && node -v && npm -v && docker --version && docker compose version'

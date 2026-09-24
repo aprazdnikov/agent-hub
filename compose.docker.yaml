@@ -1,0 +1,18 @@
+# Opt-in: give the agent the host Docker daemon (e.g. for Testcontainers, docker compose).
+#   docker compose -f compose.yaml -f compose.docker.yaml up -d
+# Needs AGENT_HUB_IMAGE=dev (Docker CLI). Socket access is root-equivalent on the host — see README.
+services:
+  agent-hub:
+    group_add:
+      - ${AGENT_HUB_DOCKER_GID:?set AGENT_HUB_DOCKER_GID in .env to the host docker group id}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      # The daemon resolves bind-mount paths on the host, so the workspace must have the same
+      # path inside the container as on the host.
+      AGENT_HUB_WORKSPACE_ROOT: ${AGENT_HUB_HOST_WORKSPACE}
+      # Containers started by the agent are siblings on the host; reach their ports via the gateway.
+      TESTCONTAINERS_HOST_OVERRIDE: host.docker.internal
+    volumes:
+      - ${AGENT_HUB_HOST_WORKSPACE}:${AGENT_HUB_HOST_WORKSPACE}
+      - /var/run/docker.sock:/var/run/docker.sock

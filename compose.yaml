@@ -2,10 +2,12 @@ services:
   agent-hub:
     build:
       context: .
+      # base: Python and git; dev: base + JDK, Maven, Node.js and npm.
+      target: ${AGENT_HUB_IMAGE:-base}
       args:
         UID: ${AGENT_HUB_UID:-1000}
         GID: ${AGENT_HUB_GID:-1000}
-    image: agent-hub:local
+    image: agent-hub:${AGENT_HUB_IMAGE:-base}
     restart: unless-stopped
     env_file: .env
     environment:
@@ -16,7 +18,12 @@ services:
       - ${AGENT_HUB_HOST_WORKSPACE:?set AGENT_HUB_HOST_WORKSPACE in .env to the host directory for /workspace}:/workspace
       - data:/data
       - claude:/home/app/.claude
+      # Build caches: a named volume by default, or a host directory (e.g. ~/.m2) to reuse it.
+      - ${AGENT_HUB_HOST_M2:-m2}:/home/app/.m2
+      - ${AGENT_HUB_HOST_NPM:-npm}:/home/app/.npm
 
 volumes:
   data:
   claude:
+  m2:
+  npm:
