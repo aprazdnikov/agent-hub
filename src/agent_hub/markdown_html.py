@@ -1,12 +1,15 @@
 """Agent Markdown → the HTML subset Telegram accepts (parse_mode=HTML).
 
 Telegram supports only inline tags plus <pre>/<blockquote>, so block structure is expressed
-with text: headings become bold, list items get bullet markers, tables become <pre> grids.
+with text: headings become bold, list items get bullet markers, tables become key-value
+lines or per-row cards.
 """
 
 import html
 import re
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from typing import final
 
 from markdown_it import MarkdownIt
 from markdown_it.tree import SyntaxTreeNode
@@ -27,7 +30,7 @@ def markdown_to_html_chunks(markdown: str, limit: int = TELEGRAM_TEXT_LIMIT) -> 
     """Render `markdown` as Telegram HTML messages, each at most `limit` characters."""
     root = SyntaxTreeNode(_PARSER.parse(markdown))
     blocks = [piece for node in root.children for piece in _top_block(node, limit)]
-    return _pack(blocks, limit)
+    return _pack(blocks, limit, _BLOCK_SEPARATOR)
 
 
 def html_to_plain(text: str) -> str:
@@ -36,6 +39,15 @@ def html_to_plain(text: str) -> str:
 
 
 def _top_block(node: SyntaxTreeNode, limit: int) -> list[str]:
+    if node.type == "table":
+        table = _table(node)
+        return [
+            chunk
+            for piece in _pack(table.pieces, limit, table.separator)
+            for chunk in (
+                [piece] if len(piece) <= limit else _split_escaped(html_to_plain(piece), limit)
+            )
+        ]
     rendered = _block(node, depth=0)
     if len(rendered) <= limit:
         return [rendered] if rendered else []
@@ -44,11 +56,11 @@ def _top_block(node: SyntaxTreeNode, limit: int) -> list[str]:
     return _split_escaped(_plain(node), limit)
 
 
-def _pack(blocks: Iterable[str], limit: int) -> list[str]:
+def _pack(blocks: Iterable[str], limit: int, separator: str) -> list[str]:
     chunks: list[str] = []
     current = ""
     for block in blocks:
-        candidate = f"{current}{_BLOCK_SEPARATOR}{block}" if current else block
+        candidate = f"{current}{separator}{block}" if current else block
         if len(candidate) <= limit:
             current = candidate
         else:
@@ -72,7 +84,7 @@ def _block(node: SyntaxTreeNode, depth: int) -> str:
         case "bullet_list" | "ordered_list":
             return _list(node, depth)
         case "table":
-            return _table(node)
+            return _table(node).joined()
         case "hr":
             return _RULE
         case _:
@@ -101,26 +113,53 @@ def _list_start(node: SyntaxTreeNode) -> int | None:
     return start if isinstance(start, int) else int(str(start))
 
 
-def _table(node: SyntaxTreeNode) -> str:
-    sections = node.children
+@final
+@dataclass(frozen=True, slots=True)
+class _Table:
+    """Table rendered as text pieces; oversized tables split only between pieces."""
+
+    pieces: tuple[str, ...]
+    separator: str
+
+    def joined(self) -> str:
+        return self.separator.join(self.pieces)
+
+
+def _table(node: SyntaxTreeNode) -> _Table:
+    # GFM tables always have a header row, and markdown-it pads body rows to its width.
+    header = [
+        _inline_content(cell)
+        for part in node.children
+        if part.type == "thead"
+        for row in part.children
+        for cell in row.children
+    ]
     rows = [
-        [_plain(cell).strip() for cell in row.children]
-        for part in sections
+        [_inline_content(cell).strip() for cell in row.children]
+        for part in node.children
+        if part.type == "tbody"
         for row in part.children
     ]
-    if not rows:
-        return ""
-    columns = max(len(row) for row in rows)
-    rows = [row + [""] * (columns - len(row)) for row in rows]
-    widths = [max(len(row[column]) for row in rows) for column in range(columns)]
-    lines = [
-        " │ ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True))
-        for row in rows
+    match len(header):
+        case 0:
+            return _Table((), "\n")
+        case 1:
+            return _Table(tuple(f"• {row[0]}" for row in rows), "\n")
+        case 2:
+            return _Table(tuple(f"<b>{row[0]}</b>: {row[1]}" for row in rows), "\n")
+        case _:
+            return _Table(tuple(_card(header, row) for row in rows), _BLOCK_SEPARATOR)
+
+
+def _card(header: Sequence[str], row: Sequence[str]) -> str:
+    """Wide rows read as cards on a phone: first cell as title, the rest as labelled fields."""
+    title, *values = row
+    fields = [
+        f"{_INDENT}{label}: {value}" if label else f"{_INDENT}{value}"
+        for label, value in zip(header[1:], values, strict=True)
+        if value
     ]
-    header_rows = len(sections[0].children) if sections and sections[0].type == "thead" else 0
-    if header_rows:
-        lines.insert(header_rows, "─┼─".join("─" * width for width in widths))
-    return _pre("\n".join(line.rstrip() for line in lines), "")
+    return "\n".join([f"<b>{title or '—'}</b>", *fields])
 
 
 def _pre(code: str, info: str) -> str:

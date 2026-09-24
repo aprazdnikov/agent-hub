@@ -54,10 +54,40 @@ def test_links_keep_safe_schemes_only() -> None:
     assert render("[x](javascript:alert(1))") == "[x](javascript:alert(1))"
 
 
-def test_table_becomes_aligned_pre() -> None:
-    assert render("| a | long |\n|---|---|\n| xx | y |") == (
-        "<pre>a  │ long\n───┼─────\nxx │ y</pre>"
+def test_two_column_table_becomes_key_value_lines() -> None:
+    assert render("| Ключ | Значение |\n|---|---|\n| timeout | **30** с |\n| retries | 3 |") == (
+        "<b>timeout</b>: <b>30</b> с\n<b>retries</b>: 3"
     )
+
+
+def test_wide_table_becomes_one_card_per_row() -> None:
+    markdown = (
+        "| Репозиторий | Язык | Тесты |\n|---|---|---|\n"
+        "| agent-hub | `Python` | 42 |\n| skill-issue | Markdown |  |"
+    )
+    assert render(markdown) == (
+        "<b>agent-hub</b>\n  Язык: <code>Python</code>\n  Тесты: 42"
+        "\n\n<b>skill-issue</b>\n  Язык: Markdown"
+    )
+
+
+def test_single_column_table_becomes_bullets() -> None:
+    assert render("| Файл |\n|---|\n| a.py |\n| b.py |") == "• a.py\n• b.py"
+
+
+def test_table_cell_escapes_markup() -> None:
+    assert render("| k | v |\n|---|---|\n| a<b | x & y |") == "<b>a&lt;b</b>: x &amp; y"
+
+
+def test_long_table_splits_between_cards() -> None:
+    rows = "\n".join(f"| row{i} | {'x' * 40} | {'y' * 40} |" for i in range(40))
+    chunks = markdown_to_html_chunks(f"| n | a | b |\n|---|---|---|\n{rows}", limit=500)
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert len(chunk) <= 500
+        assert chunk.startswith("<b>row")
+        assert chunk.count("<b>") == chunk.count("</b>")
 
 
 def test_blockquote() -> None:

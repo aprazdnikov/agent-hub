@@ -1,7 +1,8 @@
 """Claude Code backend via the Claude Agent SDK."""
 
+import base64
 import json
-from collections.abc import AsyncGenerator, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping
 from decimal import Decimal
 from typing import Any, Literal, assert_never
 
@@ -25,10 +26,14 @@ from agent_hub.config import ClaudeSettings, PermissionMode
 from agent_hub.domain import (
     AgentEvent,
     Allowed,
+    Answered,
     AssistantText,
     Denied,
     Failed,
     Finished,
+    Prompt,
+    Question,
+    QuestionOption,
     SessionId,
     SessionStarted,
     ToolCall,
@@ -38,6 +43,7 @@ from agent_hub.domain import (
 from agent_hub.render import truncate
 
 TOOL_SUMMARY_LIMIT = 600
+ASK_USER_QUESTION = "AskUserQuestion"
 # Load the operator's own Claude Code setup (CLAUDE.md, permission allowlists, skills,
 # MCP servers) so a topic behaves like `claude` started in the same directory.
 SETTING_SOURCES: list[Literal["user", "project", "local"]] = ["user", "project", "local"]
@@ -48,20 +54,12 @@ class ClaudeBackend:
         self._settings = settings
 
     async def run(
-        self, session: TopicSession, prompt: str, gate: ApprovalGate
+        self, session: TopicSession, prompt: Prompt, gate: ApprovalGate
     ) -> AsyncGenerator[AgentEvent, None]:
         async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], _context: ToolPermissionContext
         ) -> PermissionResultAllow | PermissionResultDeny:
-            request = ToolRequest(tool_name, summarize_tool_input(tool_name, tool_input))
-            decision = await gate.request(request)
-            match decision:
-                case Allowed():
-                    return PermissionResultAllow()
-                case Denied(reason):
-                    return PermissionResultDeny(message=reason)
-                case _:
-                    assert_never(decision)
+            return await decide(tool_name, tool_input, gate)
 
         options = ClaudeAgentOptions(
             cwd=session.cwd,
@@ -79,7 +77,10 @@ class ClaudeBackend:
         tracker = SessionTracker()
         try:
             async with ClaudeSDKClient(options=options) as client:
-                await client.query(prompt)
+                if prompt.images:
+                    await client.query(_one(user_message(prompt)))
+                else:
+                    await client.query(prompt.text)
                 async for message in client.receive_response():
                     for event in tracker.translate(message):
                         yield event
@@ -90,6 +91,100 @@ class ClaudeBackend:
             return
         if not tracker.terminated:
             yield Failed("Claude завершился без результата")
+
+
+async def decide(
+    tool_name: str, tool_input: dict[str, Any], gate: ApprovalGate
+) -> PermissionResultAllow | PermissionResultDeny:
+    """Permission callback: clarifying questions go to the human as questions, the rest as
+    approvals; a question input we cannot parse still reaches the human as an approval."""
+    questions = parse_questions(tool_input) if tool_name == ASK_USER_QUESTION else None
+    if questions is not None:
+        outcome = await gate.ask(questions)
+        match outcome:
+            case Answered(answers):
+                # The CLI reads the answers from the tool input and hands them to the model.
+                return PermissionResultAllow(updated_input={**tool_input, "answers": dict(answers)})
+            case Denied(reason):
+                return PermissionResultDeny(message=reason)
+            case _:
+                assert_never(outcome)
+    decision = await gate.request(
+        ToolRequest(tool_name, summarize_tool_input(tool_name, tool_input))
+    )
+    match decision:
+        case Allowed():
+            return PermissionResultAllow()
+        case Denied(reason):
+            return PermissionResultDeny(message=reason)
+        case _:
+            assert_never(decision)
+
+
+def parse_questions(tool_input: Mapping[str, Any]) -> tuple[Question, ...] | None:
+    """`AskUserQuestion` input → questions; None when it does not match the expected shape."""
+    raw = tool_input.get("questions")
+    if not isinstance(raw, list) or not raw:
+        return None
+    questions: list[Question] = []
+    for item in raw:
+        question = _parse_question(item)
+        if question is None:
+            return None
+        questions.append(question)
+    return tuple(questions)
+
+
+def _parse_question(raw: object) -> Question | None:
+    if not isinstance(raw, dict):
+        return None
+    text, header, options = raw.get("question"), raw.get("header", ""), raw.get("options", [])
+    if not isinstance(text, str) or not text.strip() or not isinstance(header, str):
+        return None
+    if not isinstance(options, list):
+        return None
+    parsed: list[QuestionOption] = []
+    for item in options:
+        option = _parse_option(item)
+        if option is None:
+            return None
+        parsed.append(option)
+    return Question(text, header, tuple(parsed), multi_select=raw.get("multiSelect") is True)
+
+
+def _parse_option(raw: object) -> QuestionOption | None:
+    if not isinstance(raw, dict):
+        return None
+    label, description = raw.get("label"), raw.get("description", "")
+    if not isinstance(label, str) or not label.strip() or not isinstance(description, str):
+        return None
+    return QuestionOption(label, description)
+
+
+def user_message(prompt: Prompt) -> dict[str, Any]:
+    """Stream-json user message with images first, as the Messages API recommends."""
+    content: list[dict[str, Any]] = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type.value,
+                "data": base64.b64encode(image.data).decode("ascii"),
+            },
+        }
+        for image in prompt.images
+    ]
+    if prompt.text.strip():
+        content.append({"type": "text", "text": prompt.text})
+    return {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+    }
+
+
+async def _one(message: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    yield message
 
 
 class SessionTracker:
@@ -108,7 +203,8 @@ class SessionTracker:
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     yield AssistantText(block.text)
-                elif isinstance(block, ToolUseBlock):
+                # A question is shown as its own message with buttons, not as a tool line.
+                elif isinstance(block, ToolUseBlock) and block.name != ASK_USER_QUESTION:
                     yield ToolCall(block.name, summarize_tool_input(block.name, block.input))
         elif isinstance(message, ResultMessage):
             self.terminated = True

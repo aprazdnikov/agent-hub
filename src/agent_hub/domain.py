@@ -63,6 +63,68 @@ Decision = Allowed | Denied
 
 @final
 @dataclass(frozen=True, slots=True)
+class QuestionOption:
+    label: str
+    description: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class Question:
+    """A clarifying question the agent asks, answered by an option label or free text."""
+
+    text: str
+    header: str
+    options: tuple[QuestionOption, ...]
+    multi_select: bool
+
+    def __post_init__(self) -> None:
+        if not self.text.strip():
+            raise ValueError("question text must not be empty")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class Answered:
+    """Answers keyed by question text; multi-select labels are joined with ", "."""
+
+    answers: tuple[tuple[str, str], ...]
+
+
+QuestionsOutcome = Answered | Denied
+
+
+class ImageMediaType(StrEnum):
+    """Image formats the Claude API accepts inline."""
+
+    JPEG = "image/jpeg"
+    PNG = "image/png"
+    GIF = "image/gif"
+    WEBP = "image/webp"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class Image:
+    media_type: ImageMediaType
+    data: bytes
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class Prompt:
+    """One user turn: text plus images sent inline to the model."""
+
+    text: str
+    images: tuple[Image, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.text.strip() and not self.images:
+            raise ValueError("prompt must have text or images")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class SessionStarted:
     session_id: SessionId
 
