@@ -6,6 +6,8 @@ from typing import Protocol
 from agent_hub.domain import (
     AgentEvent,
     Decision,
+    FileDelivery,
+    OutgoingFile,
     Prompt,
     Question,
     QuestionsOutcome,
@@ -14,17 +16,19 @@ from agent_hub.domain import (
 )
 
 
-class ApprovalGate(Protocol):
-    """Asks the human whether a tool call may run, or to answer the agent's questions."""
+class UserChannel(Protocol):
+    """The human on the other side: approves tools, answers questions, receives files."""
 
     async def request(self, tool: ToolRequest) -> Decision: ...
 
     async def ask(self, questions: Sequence[Question]) -> QuestionsOutcome: ...
 
+    async def send_file(self, file: OutgoingFile) -> FileDelivery: ...
+
 
 class AgentBackend(Protocol):
     def run(
-        self, session: TopicSession, prompt: Prompt, gate: ApprovalGate
+        self, session: TopicSession, prompt: Prompt, channel: UserChannel
     ) -> AsyncGenerator[AgentEvent, None]:
         """Run one user turn.
 

@@ -94,6 +94,24 @@ class Answered:
 QuestionsOutcome = Answered | Denied
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class OutgoingFile:
+    """A file the agent asks to deliver; `path` is as the agent wrote it, not yet checked."""
+
+    path: str
+    caption: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class Delivered:
+    pass
+
+
+FileDelivery = Delivered | Denied
+
+
 class ImageMediaType(StrEnum):
     """Image formats the Claude API accepts inline."""
 

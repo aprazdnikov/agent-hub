@@ -15,10 +15,12 @@ from claude_agent_sdk import (
 )
 
 from agent_hub.backends.claude import (
+    SEND_FILE_TOOL,
     TOOL_SUMMARY_LIMIT,
     SessionTracker,
     decide,
     parse_questions,
+    send_file_result,
     summarize_tool_input,
     user_message,
 )
@@ -27,11 +29,14 @@ from agent_hub.domain import (
     Answered,
     AssistantText,
     Decision,
+    Delivered,
     Denied,
     Failed,
+    FileDelivery,
     Finished,
     Image,
     ImageMediaType,
+    OutgoingFile,
     Prompt,
     Question,
     QuestionOption,
@@ -138,12 +143,26 @@ _ASK_QUESTION = Question(
 )
 
 
-class FakeGate:
-    def __init__(self, decision: Decision, outcome: QuestionsOutcome) -> None:
+DELIVERED = Delivered()
+
+
+class FakeChannel:
+    def __init__(
+        self,
+        decision: Decision,
+        outcome: QuestionsOutcome,
+        delivery: FileDelivery = DELIVERED,
+    ) -> None:
         self.decision = decision
         self.outcome = outcome
+        self.delivery = delivery
         self.requests: list[ToolRequest] = []
         self.asked: list[Sequence[Question]] = []
+        self.sent: list[OutgoingFile] = []
+
+    async def send_file(self, file: OutgoingFile) -> FileDelivery:
+        self.sent.append(file)
+        return self.delivery
 
     async def request(self, tool: ToolRequest) -> Decision:
         self.requests.append(tool)
@@ -173,37 +192,38 @@ def test_malformed_questions_are_rejected(tool_input: dict[str, Any]) -> None:
 
 
 async def test_answered_questions_are_returned_as_tool_input() -> None:
-    gate = FakeGate(Allowed(), Answered((("Какой формат?", "Кратко"),)))
+    channel = FakeChannel(Allowed(), Answered((("Какой формат?", "Кратко"),)))
 
-    result = await decide("AskUserQuestion", _ASK_INPUT, gate)
+    result = await decide("AskUserQuestion", _ASK_INPUT, channel)
 
-    assert gate.asked == [(_ASK_QUESTION,)]
-    assert gate.requests == []
+    assert channel.asked == [(_ASK_QUESTION,)]
+    assert channel.requests == []
     assert result == PermissionResultAllow(
         updated_input={**_ASK_INPUT, "answers": {"Какой формат?": "Кратко"}}
     )
 
 
 async def test_declined_questions_deny_the_tool() -> None:
-    gate = FakeGate(Allowed(), Denied("нет"))
-    assert await decide("AskUserQuestion", _ASK_INPUT, gate) == PermissionResultDeny(message="нет")
+    channel = FakeChannel(Allowed(), Denied("нет"))
+    result = await decide("AskUserQuestion", _ASK_INPUT, channel)
+    assert result == PermissionResultDeny(message="нет")
 
 
 async def test_malformed_question_falls_back_to_approval() -> None:
-    gate = FakeGate(Denied("нет"), Answered(()))
+    channel = FakeChannel(Denied("нет"), Answered(()))
 
-    result = await decide("AskUserQuestion", {"questions": []}, gate)
+    result = await decide("AskUserQuestion", {"questions": []}, channel)
 
-    assert gate.asked == []
-    assert [request.tool for request in gate.requests] == ["AskUserQuestion"]
+    assert channel.asked == []
+    assert [request.tool for request in channel.requests] == ["AskUserQuestion"]
     assert result == PermissionResultDeny(message="нет")
 
 
 async def test_other_tools_go_through_approval() -> None:
-    gate = FakeGate(Allowed(), Answered(()))
+    channel = FakeChannel(Allowed(), Answered(()))
 
-    assert await decide("Bash", {"command": "ls"}, gate) == PermissionResultAllow()
-    assert gate.requests == [ToolRequest("Bash", "ls")]
+    assert await decide("Bash", {"command": "ls"}, channel) == PermissionResultAllow()
+    assert channel.requests == [ToolRequest("Bash", "ls")]
 
 
 def test_user_message_puts_images_before_text() -> None:
@@ -238,5 +258,49 @@ def test_user_message_without_text_has_only_images() -> None:
 def test_question_tool_call_is_not_echoed() -> None:
     message = AssistantMessage(
         content=[ToolUseBlock(id="t1", name="AskUserQuestion", input=_ASK_INPUT)], model="claude"
+    )
+    assert list(SessionTracker().translate(message)) == []
+
+
+async def test_send_file_is_allowed_without_asking() -> None:
+    channel = FakeChannel(Denied("нет"), Answered(()))
+
+    assert await decide(SEND_FILE_TOOL, {"path": "a.pdf"}, channel) == PermissionResultAllow()
+    assert channel.requests == []
+
+
+async def test_send_file_delivers_and_reports_success() -> None:
+    channel = FakeChannel(Allowed(), Answered(()))
+
+    result = await send_file_result({"path": "out/report.pdf", "caption": "Отчёт"}, channel)
+
+    assert channel.sent == [OutgoingFile("out/report.pdf", "Отчёт")]
+    assert result.get("is_error") is not True
+    assert "report.pdf" in result["content"][0]["text"]
+
+
+async def test_send_file_failure_is_a_tool_error() -> None:
+    channel = FakeChannel(Allowed(), Answered(()), Denied("больше 50 МБ"))
+
+    result = await send_file_result({"path": "big.zip"}, channel)
+
+    assert channel.sent == [OutgoingFile("big.zip", "")]
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == "больше 50 МБ"
+
+
+@pytest.mark.parametrize("args", [{}, {"path": ""}, {"path": 1}, {"path": "a", "caption": 2}])
+async def test_send_file_rejects_malformed_arguments(args: dict[str, Any]) -> None:
+    channel = FakeChannel(Allowed(), Answered(()))
+
+    result = await send_file_result(args, channel)
+
+    assert channel.sent == []
+    assert result["is_error"] is True
+
+
+def test_send_file_call_is_not_echoed() -> None:
+    message = AssistantMessage(
+        content=[ToolUseBlock(id="t1", name=SEND_FILE_TOOL, input={"path": "a"})], model="claude"
     )
     assert list(SessionTracker().translate(message)) == []

@@ -8,6 +8,8 @@ from pathlib import Path
 UPLOADS_DIR = Path(".agent-hub/uploads")
 # Bot API getFile refuses larger files.
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+# Bot API sendDocument refuses larger files.
+MAX_SEND_BYTES = 50 * 1024 * 1024
 MAX_FILENAME_LENGTH = 100
 _UNSAFE = re.compile(r"[^\w.-]")
 # Keeps uploads out of the project's git status without touching its own .gitignore.
@@ -42,6 +44,24 @@ def prompt_text(text: str, files: Sequence[Path]) -> str:
         return text
     listing = "\n".join(["Приложенные файлы:", *(f"- {path}" for path in files)])
     return f"{text.strip()}\n\n{listing}" if text.strip() else listing
+
+
+def outgoing_path(cwd: Path, raw: str, max_bytes: int) -> Path:
+    """Resolve a file the agent wants to send; only regular files inside `cwd` qualify."""
+    root = cwd.resolve()
+    # Symlinks are resolved first so a link inside the project cannot expose a file outside it.
+    path = (root / Path(raw).expanduser()).resolve()
+    if not path.is_relative_to(root):
+        raise AttachmentError(f"{raw}: файл вне рабочей директории {root}")
+    if not path.is_file():
+        raise AttachmentError(f"{raw}: файл не найден")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise AttachmentError(
+            f"{raw}: {size // 2**20} МБ, Telegram принимает от бота не больше "
+            f"{max_bytes // 2**20} МБ"
+        )
+    return path
 
 
 def prepare_upload(cwd: Path, target: Path) -> None:

@@ -5,6 +5,7 @@ import pytest
 from agent_hub.attachments import (
     UPLOADS_DIR,
     AttachmentError,
+    outgoing_path,
     prepare_upload,
     prompt_text,
     safe_filename,
@@ -84,3 +85,29 @@ def test_prepare_upload_refuses_existing_target(tmp_path: Path) -> None:
 
     with pytest.raises(AttachmentError):
         prepare_upload(tmp_path, target)
+
+
+def test_outgoing_path_resolves_relative_to_cwd(tmp_path: Path) -> None:
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "r.pdf").write_bytes(b"%PDF")
+
+    assert outgoing_path(tmp_path, "out/r.pdf", 10) == (tmp_path / "out" / "r.pdf").resolve()
+    assert outgoing_path(tmp_path, str(tmp_path / "out" / "r.pdf"), 10).name == "r.pdf"
+
+
+@pytest.mark.parametrize("raw", ["missing.pdf", "out", "../secret", "/etc/hostname", "link"])
+def test_outgoing_path_rejects_unsendable(tmp_path: Path, raw: str) -> None:
+    cwd = tmp_path / "project"
+    (cwd / "out").mkdir(parents=True)
+    (tmp_path / "secret").write_text("x", encoding="utf-8")
+    (cwd / "link").symlink_to(tmp_path / "secret")
+
+    with pytest.raises(AttachmentError):
+        outgoing_path(cwd, raw, 10)
+
+
+def test_outgoing_path_rejects_oversized(tmp_path: Path) -> None:
+    (tmp_path / "big.bin").write_bytes(b"x" * 11)
+
+    with pytest.raises(AttachmentError):
+        outgoing_path(tmp_path, "big.bin", 10)

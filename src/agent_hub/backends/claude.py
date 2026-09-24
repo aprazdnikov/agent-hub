@@ -11,6 +11,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ClaudeSDKError,
+    McpSdkServerConfig,
     Message,
     PermissionResultAllow,
     PermissionResultDeny,
@@ -19,18 +20,22 @@ from claude_agent_sdk import (
     TextBlock,
     ToolPermissionContext,
     ToolUseBlock,
+    create_sdk_mcp_server,
+    tool,
 )
 
-from agent_hub.backends import ApprovalGate
+from agent_hub.backends import UserChannel
 from agent_hub.config import ClaudeSettings, PermissionMode
 from agent_hub.domain import (
     AgentEvent,
     Allowed,
     Answered,
     AssistantText,
+    Delivered,
     Denied,
     Failed,
     Finished,
+    OutgoingFile,
     Prompt,
     Question,
     QuestionOption,
@@ -44,6 +49,22 @@ from agent_hub.render import truncate
 
 TOOL_SUMMARY_LIMIT = 600
 ASK_USER_QUESTION = "AskUserQuestion"
+HUB_SERVER = "agent-hub"
+SEND_FILE = "send_file"
+SEND_FILE_TOOL = f"mcp__{HUB_SERVER}__{SEND_FILE}"
+_SEND_FILE_DESCRIPTION = (
+    "Send a file to the user in their Telegram chat. The user only sees your text replies, "
+    "so use this whenever they ask for a file or a file is the natural result (a PDF report, "
+    "an archive, an image, a CSV export). `path` is absolute or relative to the working "
+    "directory and must stay inside it; `caption` is optional text shown under the file."
+)
+_SEND_FILE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}, "caption": {"type": "string"}},
+    "required": ["path"],
+}
+# Tools whose result the user already sees as its own message, not as a tool line.
+_SILENT_TOOLS = frozenset({ASK_USER_QUESTION, SEND_FILE_TOOL})
 # Load the operator's own Claude Code setup (CLAUDE.md, permission allowlists, skills,
 # MCP servers) so a topic behaves like `claude` started in the same directory.
 SETTING_SOURCES: list[Literal["user", "project", "local"]] = ["user", "project", "local"]
@@ -54,12 +75,12 @@ class ClaudeBackend:
         self._settings = settings
 
     async def run(
-        self, session: TopicSession, prompt: Prompt, gate: ApprovalGate
+        self, session: TopicSession, prompt: Prompt, channel: UserChannel
     ) -> AsyncGenerator[AgentEvent, None]:
         async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], _context: ToolPermissionContext
         ) -> PermissionResultAllow | PermissionResultDeny:
-            return await decide(tool_name, tool_input, gate)
+            return await decide(tool_name, tool_input, channel)
 
         options = ClaudeAgentOptions(
             cwd=session.cwd,
@@ -73,6 +94,7 @@ class ClaudeBackend:
             ),
             setting_sources=SETTING_SOURCES,
             can_use_tool=can_use_tool,
+            mcp_servers={HUB_SERVER: _hub_server(channel)},
         )
         tracker = SessionTracker()
         try:
@@ -94,13 +116,16 @@ class ClaudeBackend:
 
 
 async def decide(
-    tool_name: str, tool_input: dict[str, Any], gate: ApprovalGate
+    tool_name: str, tool_input: dict[str, Any], channel: UserChannel
 ) -> PermissionResultAllow | PermissionResultDeny:
     """Permission callback: clarifying questions go to the human as questions, the rest as
     approvals; a question input we cannot parse still reaches the human as an approval."""
+    if tool_name == SEND_FILE_TOOL:
+        # Only reaches the user's own chat, which already sees everything the agent prints.
+        return PermissionResultAllow()
     questions = parse_questions(tool_input) if tool_name == ASK_USER_QUESTION else None
     if questions is not None:
-        outcome = await gate.ask(questions)
+        outcome = await channel.ask(questions)
         match outcome:
             case Answered(answers):
                 # The CLI reads the answers from the tool input and hands them to the model.
@@ -109,7 +134,7 @@ async def decide(
                 return PermissionResultDeny(message=reason)
             case _:
                 assert_never(outcome)
-    decision = await gate.request(
+    decision = await channel.request(
         ToolRequest(tool_name, summarize_tool_input(tool_name, tool_input))
     )
     match decision:
@@ -119,6 +144,33 @@ async def decide(
             return PermissionResultDeny(message=reason)
         case _:
             assert_never(decision)
+
+
+def _hub_server(channel: UserChannel) -> McpSdkServerConfig:
+    @tool(SEND_FILE, _SEND_FILE_DESCRIPTION, _SEND_FILE_SCHEMA)
+    async def send_file(args: dict[str, Any]) -> dict[str, Any]:
+        return await send_file_result(args, channel)
+
+    return create_sdk_mcp_server(HUB_SERVER, tools=[send_file])
+
+
+async def send_file_result(args: Mapping[str, Any], channel: UserChannel) -> dict[str, Any]:
+    """`send_file` tool body: a failed delivery is a tool error the agent can react to."""
+    path, caption = args.get("path"), args.get("caption", "")
+    if not isinstance(path, str) or not path.strip() or not isinstance(caption, str):
+        return _tool_text("path must be a non-empty string, caption a string", is_error=True)
+    delivery = await channel.send_file(OutgoingFile(path, caption))
+    match delivery:
+        case Delivered():
+            return _tool_text(f"Файл {path} отправлен пользователю", is_error=False)
+        case Denied(reason):
+            return _tool_text(reason, is_error=True)
+        case _:
+            assert_never(delivery)
+
+
+def _tool_text(text: str, *, is_error: bool) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}], "is_error": is_error}
 
 
 def parse_questions(tool_input: Mapping[str, Any]) -> tuple[Question, ...] | None:
@@ -203,8 +255,7 @@ class SessionTracker:
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     yield AssistantText(block.text)
-                # A question is shown as its own message with buttons, not as a tool line.
-                elif isinstance(block, ToolUseBlock) and block.name != ASK_USER_QUESTION:
+                elif isinstance(block, ToolUseBlock) and block.name not in _SILENT_TOOLS:
                     yield ToolCall(block.name, summarize_tool_input(block.name, block.input))
         elif isinstance(message, ResultMessage):
             self.terminated = True

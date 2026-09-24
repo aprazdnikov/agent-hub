@@ -40,8 +40,10 @@ from agent_hub.approvals import (
 )
 from agent_hub.attachments import (
     MAX_DOWNLOAD_BYTES,
+    MAX_SEND_BYTES,
     UPLOADS_DIR,
     AttachmentError,
+    outgoing_path,
     prepare_upload,
     prompt_text,
     upload_path,
@@ -56,11 +58,14 @@ from agent_hub.domain import (
     AssistantText,
     BackendKind,
     Decision,
+    Delivered,
     Denied,
     Failed,
+    FileDelivery,
     Finished,
     Image,
     ImageMediaType,
+    OutgoingFile,
     Prompt,
     Question,
     QuestionsOutcome,
@@ -91,6 +96,9 @@ APPROVAL_TEXT_LIMIT = 3500
 TOOL_CALL_TEXT_LIMIT = 900
 FAILURE_TEXT_LIMIT = 3500
 ANSWER_TEXT_LIMIT = 500
+CAPTION_TEXT_LIMIT = 1024  # Telegram media caption limit
+# Uploads of large documents take far longer than the default request timeout.
+SEND_FILE_TIMEOUT_SECONDS = 120
 # Telegram delivers album parts as separate updates sharing a media_group_id.
 ALBUM_WAIT_SECONDS = 1.0
 
@@ -187,6 +195,26 @@ class TelegramSender:
         except TelegramError:
             log.exception("telegram edit failed", extra={"message_id": message.message_id})
 
+    async def document(self, key: TopicKey, path: Path, caption: str) -> None:
+        """Unlike text, a failed file delivery is raised: the agent must learn about it."""
+        for attempt in range(2):
+            try:
+                await self._bot.send_document(
+                    chat_id=key.chat_id,
+                    message_thread_id=key.thread_id,
+                    document=path,
+                    filename=path.name,
+                    caption=truncate(caption, CAPTION_TEXT_LIMIT) or None,
+                    write_timeout=SEND_FILE_TIMEOUT_SECONDS,
+                    read_timeout=SEND_FILE_TIMEOUT_SECONDS,
+                )
+            except RetryAfter as error:
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(_seconds(error.retry_after))
+            else:
+                return
+
     async def typing(self, key: TopicKey) -> None:
         try:
             await self._bot.send_chat_action(
@@ -196,20 +224,37 @@ class TelegramSender:
             log.warning("telegram chat action failed", extra=_fields(key))
 
 
-class TelegramApprovalGate:
+@final
+@dataclass(frozen=True, slots=True)
+class Pending:
+    """Hub-wide registries of prompts waiting for a button press or reply."""
+
+    approvals: ApprovalRegistry
+    questions: QuestionRegistry
+
+
+class TelegramChannel:
     def __init__(
-        self,
-        sender: TelegramSender,
-        key: TopicKey,
-        registry: ApprovalRegistry,
-        question_registry: QuestionRegistry,
-        timeout: int,
+        self, sender: TelegramSender, key: TopicKey, cwd: Path, pending: Pending, timeout: int
     ) -> None:
         self._sender = sender
         self._key = key
-        self._registry = registry
-        self._questions = question_registry
+        self._cwd = cwd
+        self._registry = pending.approvals
+        self._questions = pending.questions
         self._timeout = timeout
+
+    async def send_file(self, file: OutgoingFile) -> FileDelivery:
+        try:
+            path = await asyncio.to_thread(outgoing_path, self._cwd, file.path, MAX_SEND_BYTES)
+            await self._sender.document(self._key, path, file.caption)
+        except AttachmentError as error:
+            return Denied(str(error))
+        except (TelegramError, OSError) as error:
+            log.warning("file delivery failed", extra={**_fields(self._key), "error": str(error)})
+            return Denied(f"Telegram не принял файл: {error}")
+        log.info("file sent", extra={**_fields(self._key), "file": path.name})
+        return Delivered()
 
     async def ask(self, questions: Sequence[Question]) -> QuestionsOutcome:
         answers: list[tuple[str, str]] = []
@@ -281,6 +326,7 @@ class Hub:
         self._backends = backends
         self._approvals = ApprovalRegistry()
         self._questions = QuestionRegistry()
+        self._pending = Pending(self._approvals, self._questions)
         self._running: dict[TopicKey, asyncio.Task[None]] = {}
         self._albums: dict[str, list[Message]] = {}
         self._album_flushes: set[asyncio.Task[None]] = set()
@@ -445,7 +491,7 @@ class Hub:
         result = self._questions.press(press)
         match result:
             case Accepted():
-                # The asking gate edits the message once it sees the answer.
+                # The asking channel edits the message once it sees the answer.
                 await query.answer()
             case SelectionChanged(question, selected):
                 await query.answer()
@@ -527,8 +573,8 @@ class Hub:
         incoming: Incoming,
     ) -> None:
         backend = self._backends[session.backend]
-        gate = TelegramApprovalGate(
-            sender, key, self._approvals, self._questions, self._settings.approval_timeout_seconds
+        channel = TelegramChannel(
+            sender, key, session.cwd, self._pending, self._settings.approval_timeout_seconds
         )
         log.info(
             "turn started",
@@ -547,7 +593,7 @@ class Hub:
                 log.warning("attachment rejected", extra={**_fields(key), "reason": str(error)})
                 await sender.text(key, f"⚠️ {error}")
                 return
-            async with aclosing(backend.run(session, prompt, gate)) as events:
+            async with aclosing(backend.run(session, prompt, channel)) as events:
                 async for event in events:
                     await self._on_event(sender, key, event)
         except asyncio.CancelledError:
