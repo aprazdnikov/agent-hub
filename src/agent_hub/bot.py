@@ -1,6 +1,7 @@
 """Telegram shell: forum topics ↔ agent sessions."""
 
 import asyncio
+import html
 import logging
 from collections.abc import Mapping
 from contextlib import aclosing
@@ -14,8 +15,8 @@ from telegram import (
     Message,
     Update,
 )
-from telegram.constants import ChatAction
-from telegram.error import RetryAfter, TelegramError
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -52,6 +53,7 @@ from agent_hub.domain import (
     TopicKey,
     TopicSession,
 )
+from agent_hub.markdown_html import html_to_plain, markdown_to_html_chunks
 from agent_hub.render import format_finished, split_message, truncate
 from agent_hub.store import TopicStore
 from agent_hub.workspace import InvalidCwdError, resolve_cwd
@@ -59,6 +61,7 @@ from agent_hub.workspace import InvalidCwdError, resolve_cwd
 log = logging.getLogger(__name__)
 
 APPROVAL_TEXT_LIMIT = 3500
+TOOL_CALL_TEXT_LIMIT = 900
 FAILURE_TEXT_LIMIT = 3500
 
 HELP = """\
@@ -86,8 +89,16 @@ class TelegramSender:
         for chunk in split_message(text):
             await self.one(key, chunk)
 
+    async def markdown(self, key: TopicKey, markdown: str) -> None:
+        for chunk in markdown_to_html_chunks(markdown):
+            await self.one(key, chunk, parse_mode=ParseMode.HTML)
+
     async def one(
-        self, key: TopicKey, text: str, markup: InlineKeyboardMarkup | None = None
+        self,
+        key: TopicKey,
+        text: str,
+        markup: InlineKeyboardMarkup | None = None,
+        parse_mode: ParseMode | None = None,
     ) -> Message | None:
         for attempt in range(2):
             try:
@@ -96,20 +107,31 @@ class TelegramSender:
                     message_thread_id=key.thread_id,
                     text=text,
                     reply_markup=markup,
+                    parse_mode=parse_mode,
                 )
             except RetryAfter as error:
                 if attempt == 1:
                     log.warning("telegram rate limit persisted", extra=_fields(key))
                     return None
                 await asyncio.sleep(_seconds(error.retry_after))
+            except BadRequest as error:
+                if parse_mode is None:
+                    log.exception("telegram send failed", extra=_fields(key))
+                    return None
+                # A formatting bug must not lose the message: resend it as plain text.
+                log.warning(
+                    "telegram rejected formatting, sending plain text",
+                    extra={**_fields(key), "error": str(error)},
+                )
+                return await self.one(key, html_to_plain(text), markup)
             except TelegramError:
                 log.exception("telegram send failed", extra=_fields(key))
                 return None
         return None
 
-    async def edit(self, message: Message, text: str) -> None:
+    async def edit(self, message: Message, text: str, parse_mode: ParseMode | None = None) -> None:
         try:
-            await message.edit_text(text, reply_markup=None)
+            await message.edit_text(text, reply_markup=None, parse_mode=parse_mode)
         except TelegramError:
             log.exception("telegram edit failed", extra={"message_id": message.message_id})
 
@@ -146,14 +168,17 @@ class TelegramApprovalGate:
                     ]
                 ]
             )
-            text = truncate(f"🔐 {tool.tool}\n{tool.summary}", APPROVAL_TEXT_LIMIT)
-            prompt = await self._sender.one(self._key, text, markup)
+            summary = html.escape(truncate(tool.summary, APPROVAL_TEXT_LIMIT))
+            text = f"🔐 <b>{html.escape(tool.tool)}</b>\n<pre>{summary}</pre>"
+            prompt = await self._sender.one(self._key, text, markup, ParseMode.HTML)
             if prompt is None:
                 return Denied("Не удалось отправить запрос подтверждения в Telegram")
             try:
                 return await asyncio.wait_for(future, self._timeout)
             except TimeoutError:
-                await self._sender.edit(prompt, f"{text}\n\n⌛ Нет ответа — запрещено")
+                await self._sender.edit(
+                    prompt, f"{text}\n\n⌛ Нет ответа — запрещено", ParseMode.HTML
+                )
                 return Denied(f"Нет ответа пользователя за {self._timeout} с")
         finally:
             self._registry.close(approval_id)
@@ -310,7 +335,7 @@ class Hub:
                 assert_never(answer.decision)
         if isinstance(query.message, Message):
             await TelegramSender(query.get_bot()).edit(
-                query.message, f"{query.message.text or ''}\n\n{verdict}"
+                query.message, f"{query.message.text_html}\n\n{verdict}", ParseMode.HTML
             )
 
     async def _text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -357,9 +382,14 @@ class Hub:
                 # Persist immediately so a crash mid-turn can still resume this session.
                 self._store.put(key, self._session(key).with_session(session_id))
             case AssistantText(text):
-                await sender.text(key, text)
+                await sender.markdown(key, text)
             case ToolCall(tool, summary):
-                await sender.text(key, truncate(f"🔧 {tool}: {summary}", 1000))
+                line = html.escape(truncate(summary, TOOL_CALL_TEXT_LIMIT))
+                await sender.one(
+                    key,
+                    f"🔧 <b>{html.escape(tool)}</b> <code>{line}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
             case Finished(session_id, turns, cost_usd):
                 self._store.put(key, self._session(key).with_session(session_id))
                 log.info("turn finished", extra={**_fields(key), "turns": turns})
