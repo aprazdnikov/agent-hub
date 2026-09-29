@@ -229,7 +229,7 @@ async def test_other_tools_go_through_approval() -> None:
 def test_user_message_puts_images_before_text() -> None:
     prompt = Prompt("что на фото?", (Image(ImageMediaType.JPEG, b"\xff\xd8"),))
 
-    assert user_message(prompt) == {
+    assert user_message(prompt, "p1") == {
         "type": "user",
         "message": {
             "role": "user",
@@ -246,12 +246,13 @@ def test_user_message_puts_images_before_text() -> None:
             ],
         },
         "parent_tool_use_id": None,
+        "uuid": "p1",
     }
 
 
 def test_user_message_without_text_has_only_images() -> None:
     prompt = Prompt("", (Image(ImageMediaType.PNG, b"x"),))
-    content = user_message(prompt)["message"]["content"]
+    content = user_message(prompt, "p1")["message"]["content"]
     assert [block["type"] for block in content] == ["image"]
 
 

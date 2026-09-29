@@ -26,13 +26,21 @@ class UserChannel(Protocol):
     async def send_file(self, file: OutgoingFile) -> FileDelivery: ...
 
 
+class Inbox(Protocol):
+    """Further user messages for a session that is still open."""
+
+    async def get(self) -> Prompt: ...
+
+
 class AgentBackend(Protocol):
     def run(
-        self, session: TopicSession, prompt: Prompt, channel: UserChannel
+        self, session: TopicSession, prompt: Prompt, channel: UserChannel, inbox: Inbox
     ) -> AsyncGenerator[AgentEvent, None]:
-        """Run one user turn.
+        """Run an agent session starting with `prompt`.
 
-        Must end with exactly one `Finished` or `Failed` event and must not raise for
-        agent-side failures; cancellation is propagated as `CancelledError`.
+        The session stays open while the agent is busy or has background tasks, taking
+        further prompts from `inbox`. Every agent turn ends with one `Finished` or
+        `Failed` event. Agent-side failures are events, not exceptions; cancellation is
+        propagated as `CancelledError`.
         """
         ...

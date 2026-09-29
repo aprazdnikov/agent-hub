@@ -1,5 +1,6 @@
 """Pure formatting of agent output for Telegram."""
 
+from collections.abc import Sequence
 from decimal import Decimal
 
 TELEGRAM_TEXT_LIMIT = 4096
@@ -26,6 +27,15 @@ def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def format_finished(turns: int, cost_usd: Decimal | None) -> str:
+def format_finished(turns: int, cost_usd: Decimal | None, background: int = 0) -> str:
     cost = "" if cost_usd is None else f" · ${cost_usd.quantize(Decimal('0.01'))}"
-    return f"✅ Готово · ходов: {turns}{cost}"
+    pending = f" · ⏳ в фоне задач: {background}, пришлю результат" if background else ""
+    return f"✅ Готово · ходов: {turns}{cost}{pending}"
+
+
+def format_abandoned(tasks: Sequence[str], timeout_seconds: int) -> str:
+    listing = "\n".join(f"• {task}" for task in tasks)
+    return (
+        f"⌛ Фоновые задачи не завершились за {timeout_seconds // 60} мин, сессия закрыта:\n"
+        f"{listing}"
+    )

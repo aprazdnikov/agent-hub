@@ -10,6 +10,7 @@ from typing import final
 PREFIX = "AGENT_HUB_"
 DEFAULT_STATE_FILE = Path("~/.local/state/agent-hub/topics.json")
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 600
+DEFAULT_BACKGROUND_TIMEOUT_SECONDS = 1800
 
 
 class ConfigError(Exception):
@@ -31,6 +32,7 @@ class ClaudeSettings:
     permission_mode: PermissionMode
     model: str | None
     max_budget_usd: Decimal | None
+    background_timeout_seconds: int
 
 
 @final
@@ -64,6 +66,11 @@ def load_settings(env: Mapping[str, str]) -> Settings:
             permission_mode=_parse_permission_mode(_optional(env, "CLAUDE_PERMISSION_MODE")),
             model=_optional(env, "CLAUDE_MODEL"),
             max_budget_usd=_parse_budget(_optional(env, "CLAUDE_MAX_BUDGET_USD")),
+            background_timeout_seconds=_parse_positive_int(
+                _optional(env, "BACKGROUND_TIMEOUT_SECONDS"),
+                "BACKGROUND_TIMEOUT_SECONDS",
+                DEFAULT_BACKGROUND_TIMEOUT_SECONDS,
+            ),
         ),
     )
 

@@ -3,7 +3,7 @@
 import asyncio
 import html
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import timedelta
@@ -57,6 +57,7 @@ from agent_hub.domain import (
     Answered,
     AssistantText,
     BackendKind,
+    BackgroundAbandoned,
     Decision,
     Delivered,
     Denied,
@@ -86,7 +87,7 @@ from agent_hub.questions import (
     keyboard,
     question_html,
 )
-from agent_hub.render import format_finished, split_message, truncate
+from agent_hub.render import format_abandoned, format_finished, split_message, truncate
 from agent_hub.store import TopicStore
 from agent_hub.workspace import InvalidCwdError, resolve_cwd
 
@@ -137,6 +138,15 @@ class Incoming:
     text: str
     photos: tuple[Upload, ...] = ()
     files: tuple[Upload, ...] = ()
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class LiveSession:
+    """An open agent session of a topic; messages sent meanwhile go to its inbox."""
+
+    task: "asyncio.Task[None]"
+    inbox: "asyncio.Queue[Prompt]"
 
 
 class TelegramSender:
@@ -327,9 +337,10 @@ class Hub:
         self._approvals = ApprovalRegistry()
         self._questions = QuestionRegistry()
         self._pending = Pending(self._approvals, self._questions)
-        self._running: dict[TopicKey, asyncio.Task[None]] = {}
+        self._running: dict[TopicKey, LiveSession] = {}
         self._albums: dict[str, list[Message]] = {}
-        self._album_flushes: set[asyncio.Task[None]] = set()
+        # Unawaited helper tasks (album flushes, attachment downloads), kept to cancel on stop.
+        self._helpers: set[asyncio.Task[None]] = set()
 
     def build_application(self) -> Application[Any, Any, Any, Any, Any, Any]:
         app = (
@@ -442,11 +453,11 @@ class Hub:
         key = await self._topic_or_hint(update)
         if key is None:
             return
-        task = self._running.get(key)
-        if task is None:
+        live = self._running.get(key)
+        if live is None:
             await TelegramSender(context.bot).text(key, "Нечего останавливать")
             return
-        task.cancel()
+        live.task.cancel()
 
     async def _status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         key = await self._topic_or_hint(update)
@@ -530,9 +541,7 @@ class Hub:
         parts = self._albums.setdefault(group, [])
         parts.append(message)
         if len(parts) == 1:
-            flush = asyncio.create_task(self._flush_album(context.bot, key, group))
-            self._album_flushes.add(flush)
-            flush.add_done_callback(self._album_flushes.discard)
+            self._helper(self._flush_album(context.bot, key, group))
 
     async def _flush_album(self, bot: Bot, key: TopicKey, group: str) -> None:
         await asyncio.sleep(ALBUM_WAIT_SECONDS)
@@ -552,57 +561,102 @@ class Hub:
             )
 
     async def _start_turn(self, bot: Bot, key: TopicKey, incoming: Incoming) -> None:
-        if await self._refuse_if_running(key, bot):
+        live = self._running.get(key)
+        if live is None:
+            self._launch(bot, key, incoming)
+        elif incoming.photos or incoming.files:
+            self._helper(self._forward(bot, key, incoming))
+        else:
+            live.inbox.put_nowait(Prompt(incoming.text))
+
+    async def _forward(self, bot: Bot, key: TopicKey, incoming: Incoming) -> None:
+        """Attachments sent to an open session: download first, then deliver."""
+        sender = TelegramSender(bot)
+        try:
+            prompt = await _download(bot, self._session(key).cwd, incoming)
+        except AttachmentError as error:
+            log.warning("attachment rejected", extra={**_fields(key), "reason": str(error)})
+            await sender.text(key, f"⚠️ {error}")
             return
-        session = self._session(key)
+        # The session may have closed during the download.
+        live = self._running.get(key)
+        if live is None:
+            self._launch(bot, key, prompt)
+        else:
+            live.inbox.put_nowait(prompt)
+
+    def _launch(self, bot: Bot, key: TopicKey, first: Incoming | Prompt) -> None:
+        inbox: asyncio.Queue[Prompt] = asyncio.Queue()
         task = asyncio.create_task(
-            self._run_turn(bot, TelegramSender(bot), key, session, incoming),
-            name=f"turn-{key.chat_id}-{key.thread_id}",
+            self._run_session(bot, key, first, inbox),
+            name=f"session-{key.chat_id}-{key.thread_id}",
         )
-        self._running[key] = task
-        task.add_done_callback(lambda done: self._forget(key, done))
+        self._running[key] = LiveSession(task, inbox)
+
+    def _helper(self, work: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(self._guarded(work))
+        self._helpers.add(task)
+        task.add_done_callback(self._helpers.discard)
+
+    async def _guarded(self, work: Coroutine[Any, Any, None]) -> None:
+        try:
+            await work
+        except Exception:  # background task boundary: nobody awaits this task
+            log.exception("helper task failed")
 
     # --- agent run ------------------------------------------------------------
 
-    async def _run_turn(
-        self,
-        bot: Bot,
-        sender: TelegramSender,
-        key: TopicKey,
-        session: TopicSession,
-        incoming: Incoming,
+    async def _run_session(
+        self, bot: Bot, key: TopicKey, first: Incoming | Prompt, inbox: "asyncio.Queue[Prompt]"
     ) -> None:
-        backend = self._backends[session.backend]
-        channel = TelegramChannel(
-            sender, key, session.cwd, self._pending, self._settings.approval_timeout_seconds
-        )
-        log.info(
-            "turn started",
-            extra={
-                **_fields(key),
-                "backend": session.backend.value,
-                "photos": len(incoming.photos),
-                "files": len(incoming.files),
-            },
-        )
+        sender = TelegramSender(bot)
+        live = self._running[key]
+        log.info("session started", extra=_fields(key))
         try:
             await sender.typing(key)
-            try:
-                prompt = await _download(bot, session.cwd, incoming)
-            except AttachmentError as error:
-                log.warning("attachment rejected", extra={**_fields(key), "reason": str(error)})
-                await sender.text(key, f"⚠️ {error}")
-                return
-            async with aclosing(backend.run(session, prompt, channel)) as events:
-                async for event in events:
-                    await self._on_event(sender, key, event)
+            if isinstance(first, Incoming):
+                try:
+                    first = await _download(bot, self._session(key).cwd, first)
+                except AttachmentError as error:
+                    log.warning("attachment rejected", extra={**_fields(key), "reason": str(error)})
+                    await sender.text(key, f"⚠️ {error}")
+                    return
+            prompt = first
+            while True:
+                await self._converse(sender, key, prompt, inbox)
+                # No await between this check and the release: a message arriving now must
+                # either be seen here or start a new session.
+                if inbox.empty():
+                    self._release(key, live)
+                    return
+                prompt = inbox.get_nowait()
         except asyncio.CancelledError:
-            log.info("turn cancelled", extra=_fields(key))
+            self._release(key, live)
+            log.info("session cancelled", extra=_fields(key))
             await sender.text(key, "⏹ Остановлено")
             raise
         except Exception:  # background task boundary: record and report
-            log.exception("turn crashed", extra=_fields(key))
+            self._release(key, live)
+            log.exception("session crashed", extra=_fields(key))
             await sender.text(key, "💥 Внутренняя ошибка agent-hub, подробности в логе сервиса")
+        finally:
+            self._release(key, live)
+
+    async def _converse(
+        self, sender: TelegramSender, key: TopicKey, prompt: Prompt, inbox: "asyncio.Queue[Prompt]"
+    ) -> None:
+        session = self._session(key)
+        channel = TelegramChannel(
+            sender, key, session.cwd, self._pending, self._settings.approval_timeout_seconds
+        )
+        backend = self._backends[session.backend]
+        async with aclosing(backend.run(session, prompt, channel, inbox)) as events:
+            async for event in events:
+                await self._on_event(sender, key, event)
+
+    def _release(self, key: TopicKey, live: LiveSession) -> None:
+        if self._running.get(key) is live:
+            del self._running[key]
 
     async def _on_event(self, sender: TelegramSender, key: TopicKey, event: AgentEvent) -> None:
         match event:
@@ -618,10 +672,17 @@ class Hub:
                     f"🔧 <b>{html.escape(tool)}</b> <code>{line}</code>",
                     parse_mode=ParseMode.HTML,
                 )
-            case Finished(session_id, turns, cost_usd):
+            case Finished(session_id, turns, cost_usd, background):
                 self._store.put(key, self._session(key).with_session(session_id))
-                log.info("turn finished", extra={**_fields(key), "turns": turns})
-                await sender.text(key, format_finished(turns, cost_usd))
+                log.info(
+                    "turn finished",
+                    extra={**_fields(key), "turns": turns, "background": background},
+                )
+                await sender.text(key, format_finished(turns, cost_usd, background))
+            case BackgroundAbandoned(tasks):
+                log.warning("background abandoned", extra={**_fields(key), "tasks": len(tasks)})
+                timeout = self._settings.claude.background_timeout_seconds
+                await sender.text(key, format_abandoned(tasks, timeout))
             case Failed(reason):
                 log.warning("turn failed", extra={**_fields(key), "reason": reason})
                 await sender.text(key, truncate(f"❌ {reason}", FAILURE_TEXT_LIMIT))
@@ -654,12 +715,8 @@ class Hub:
         )
         return True
 
-    def _forget(self, key: TopicKey, task: asyncio.Task[None]) -> None:
-        if self._running.get(key) is task:
-            del self._running[key]
-
     async def _cancel_all(self, _: Application[Any, Any, Any, Any, Any, Any]) -> None:
-        tasks = [*self._running.values(), *self._album_flushes]
+        tasks = [*(live.task for live in self._running.values()), *self._helpers]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

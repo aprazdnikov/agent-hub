@@ -1,12 +1,17 @@
 """Claude Code backend via the Claude Agent SDK."""
 
+import asyncio
 import base64
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping
+import time
+import uuid
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterator, Mapping
 from decimal import Decimal
-from typing import Any, Literal, assert_never
+from enum import Enum, auto
+from typing import Any, Literal, Protocol, assert_never
 
 from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES,
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -17,20 +22,25 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ResultMessage,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ToolPermissionContext,
     ToolUseBlock,
+    UserMessage,
     create_sdk_mcp_server,
     tool,
 )
 
-from agent_hub.backends import UserChannel
+from agent_hub.backends import Inbox, UserChannel
 from agent_hub.config import ClaudeSettings, PermissionMode
 from agent_hub.domain import (
     AgentEvent,
     Allowed,
     Answered,
     AssistantText,
+    BackgroundAbandoned,
     Delivered,
     Denied,
     Failed,
@@ -63,6 +73,8 @@ _SEND_FILE_SCHEMA: dict[str, Any] = {
     "properties": {"path": {"type": "string"}, "caption": {"type": "string"}},
     "required": ["path"],
 }
+# After a background task reports, the CLI starts a turn of its own within this window.
+SETTLE_SECONDS = 30
 # Tools whose result the user already sees as its own message, not as a tool line.
 _SILENT_TOOLS = frozenset({ASK_USER_QUESTION, SEND_FILE_TOOL})
 # Load the operator's own Claude Code setup (CLAUDE.md, permission allowlists, skills,
@@ -75,7 +87,7 @@ class ClaudeBackend:
         self._settings = settings
 
     async def run(
-        self, session: TopicSession, prompt: Prompt, channel: UserChannel
+        self, session: TopicSession, prompt: Prompt, channel: UserChannel, inbox: Inbox
     ) -> AsyncGenerator[AgentEvent, None]:
         async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], _context: ToolPermissionContext
@@ -95,24 +107,177 @@ class ClaudeBackend:
             setting_sources=SETTING_SOURCES,
             can_use_tool=can_use_tool,
             mcp_servers={HUB_SERVER: _hub_server(channel)},
+            # Echoes each prompt when a turn takes it in: prompts sent mid-turn are merged
+            # into that turn, so counting results cannot tell when all prompts are answered.
+            extra_args={"replay-user-messages": None},
         )
-        tracker = SessionTracker()
+        activity = SessionActivity()
         try:
             async with ClaudeSDKClient(options=options) as client:
-                if prompt.images:
-                    await client.query(_one(user_message(prompt)))
-                else:
-                    await client.query(prompt.text)
-                async for message in client.receive_response():
-                    for event in tracker.translate(message):
-                        yield event
+                activity.sent(await _send(client, prompt))
+                async for event in self.converse(client, inbox, activity):
+                    yield event
         except ClaudeSDKError as error:
-            # ResultError is raised after its ResultMessage was already translated.
-            if not tracker.terminated:
+            # The CLI exiting after its last result (e.g. ResultError) is not a failure.
+            if activity.awaiting_result:
                 yield Failed(f"{type(error).__name__}: {error}")
             return
-        if not tracker.terminated:
+        if activity.awaiting_result:
             yield Failed("Claude завершился без результата")
+
+    async def converse(
+        self, client: "Conversation", inbox: Inbox, activity: "SessionActivity"
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Relay messages and further prompts until the session has nothing left to do.
+
+        Closing the client kills the CLI with its background tasks, so it stays open while
+        they run; their results arrive as turns the CLI starts on its own.
+        """
+        tracker = SessionTracker()
+        messages = client.receive_messages()
+        next_message = asyncio.ensure_future(anext(messages))
+        next_prompt = asyncio.ensure_future(inbox.get())
+        deadline: float | None = None
+        try:
+            # A prompt already taken from the inbox must be sent even if the session is idle.
+            while (phase := activity.phase) is not Phase.IDLE or next_prompt.done():
+                deadline = self._deadline(phase, deadline)
+                timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                done, _ = await asyncio.wait(
+                    {next_message, next_prompt},
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    if phase is Phase.BACKGROUND:
+                        yield BackgroundAbandoned(activity.background)
+                    return
+                if next_prompt in done:
+                    activity.sent(await _send(client, next_prompt.result()))
+                    next_prompt = asyncio.ensure_future(inbox.get())
+                if next_message in done:
+                    try:
+                        message = next_message.result()
+                    except StopAsyncIteration:
+                        return
+                    activity.observe(message)
+                    for event in tracker.translate(message, len(activity.background)):
+                        yield event
+                    next_message = asyncio.ensure_future(anext(messages))
+        finally:
+            next_message.cancel()
+            next_prompt.cancel()
+
+    def _deadline(self, phase: "Phase", current: float | None) -> float | None:
+        """Absolute time to give up waiting in `phase`; None waits indefinitely."""
+        match phase:
+            case Phase.BUSY | Phase.IDLE:
+                # A working agent is only stopped by the user (/stop).
+                return None
+            case Phase.BACKGROUND:
+                if current is not None:
+                    return current
+                return time.monotonic() + self._settings.background_timeout_seconds
+            case Phase.SETTLING:
+                return time.monotonic() + SETTLE_SECONDS
+            case _:
+                assert_never(phase)
+
+
+class Conversation(Protocol):
+    """The part of `ClaudeSDKClient` a session needs."""
+
+    def receive_messages(self) -> AsyncIterator[Message]: ...
+
+    async def query(self, prompt: str | AsyncIterable[dict[str, Any]]) -> None: ...
+
+
+async def _send(client: Conversation, prompt: Prompt) -> str:
+    """Send `prompt` under a fresh id, which the CLI echoes back when it takes it in."""
+    prompt_id = str(uuid.uuid4())
+    await client.query(_one(user_message(prompt, prompt_id)))
+    return prompt_id
+
+
+class Phase(Enum):
+    BUSY = auto()  # the agent is working on a turn
+    BACKGROUND = auto()  # idle, but background tasks are still running
+    SETTLING = auto()  # tasks reported; the CLI is about to start a turn with their results
+    IDLE = auto()  # nothing left; the session can be closed
+
+
+class SessionActivity:
+    """Tracks what the CLI session is still doing, to know when closing it loses nothing.
+
+    Only backgrounded tasks matter: foreground subagents finish inside their turn, while a
+    background task reports in a turn the CLI starts on its own after the task ends.
+    """
+
+    def __init__(self) -> None:
+        self._waiting: set[str] = set()  # sent prompts the CLI has not taken in yet
+        self._answering = False  # a turn with our prompts is in progress
+        self._tasks: dict[str, str] = {}  # running background task id -> description
+        self._report_due = False  # a background task ended; its report turn has not begun
+        self._reporting = False  # a report turn started by the CLI is in progress
+
+    def sent(self, prompt_id: str) -> None:
+        self._waiting.add(prompt_id)
+
+    @property
+    def awaiting_result(self) -> bool:
+        return bool(self._waiting) or self._answering
+
+    @property
+    def background(self) -> tuple[str, ...]:
+        return tuple(self._tasks.values())
+
+    @property
+    def phase(self) -> Phase:
+        if self.awaiting_result or self._reporting:
+            return Phase.BUSY
+        if self._tasks:
+            return Phase.BACKGROUND
+        if self._report_due:
+            # Also covers a task killed without a report: the settling window closes it.
+            return Phase.SETTLING
+        return Phase.IDLE
+
+    def observe(self, message: Message) -> None:
+        match message:
+            case UserMessage(uuid=str(prompt_id)) if prompt_id in self._waiting:
+                self._waiting.discard(prompt_id)
+                self._answering = True
+            case TaskStartedMessage() if message.data.get("is_backgrounded") is not False:
+                self._tasks[message.task_id] = message.description
+            case TaskNotificationMessage():
+                self._task_ended(message.task_id)
+            case TaskUpdatedMessage() if _is_terminal(message):
+                # Arrives before the notification, so it alone must not close the session.
+                self._task_ended(message.task_id)
+            case ResultMessage() if _is_injected(message):
+                self._reporting = False
+            case ResultMessage():
+                self._answering = False
+            case AssistantMessage() | SystemMessage(subtype="init") if (
+                self._report_due and not self._answering
+            ):
+                self._report_due = False
+                self._reporting = True
+            case _:
+                pass
+
+    def _task_ended(self, task_id: str) -> None:
+        if self._tasks.pop(task_id, None) is not None:
+            self._report_due = True
+
+
+def _is_terminal(message: TaskUpdatedMessage) -> bool:
+    status = message.status or message.patch.get("status")
+    return status in TERMINAL_TASK_STATUSES
+
+
+def _is_injected(message: ResultMessage) -> bool:
+    return message.origin is not None and message.origin["kind"] != "human"
 
 
 async def decide(
@@ -213,7 +378,7 @@ def _parse_option(raw: object) -> QuestionOption | None:
     return QuestionOption(label, description)
 
 
-def user_message(prompt: Prompt) -> dict[str, Any]:
+def user_message(prompt: Prompt, prompt_id: str) -> dict[str, Any]:
     """Stream-json user message with images first, as the Messages API recommends."""
     content: list[dict[str, Any]] = [
         {
@@ -232,6 +397,7 @@ def user_message(prompt: Prompt) -> dict[str, Any]:
         "type": "user",
         "message": {"role": "user", "content": content},
         "parent_tool_use_id": None,
+        "uuid": prompt_id,
     }
 
 
@@ -246,7 +412,7 @@ class SessionTracker:
         self.session_id: SessionId | None = None
         self.terminated = False
 
-    def translate(self, message: Message) -> Iterator[AgentEvent]:
+    def translate(self, message: Message, background: int = 0) -> Iterator[AgentEvent]:
         found = _session_id_of(message)
         if found is not None and found != self.session_id:
             self.session_id = found
@@ -270,6 +436,7 @@ class SessionTracker:
                         if message.total_cost_usd is None
                         else Decimal(str(message.total_cost_usd))
                     ),
+                    background=background,
                 )
 
 

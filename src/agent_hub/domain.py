@@ -163,9 +163,12 @@ class ToolCall:
 @final
 @dataclass(frozen=True, slots=True)
 class Finished:
+    """One agent turn ended; `background` tasks keep running and report in later turns."""
+
     session_id: SessionId
     turns: int
     cost_usd: Decimal | None
+    background: int = 0
 
 
 @final
@@ -174,4 +177,12 @@ class Failed:
     reason: str
 
 
-AgentEvent = SessionStarted | AssistantText | ToolCall | Finished | Failed
+@final
+@dataclass(frozen=True, slots=True)
+class BackgroundAbandoned:
+    """Background tasks outlived the wait budget; the session was closed without them."""
+
+    tasks: tuple[str, ...]
+
+
+AgentEvent = SessionStarted | AssistantText | ToolCall | Finished | Failed | BackgroundAbandoned

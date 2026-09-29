@@ -5,6 +5,7 @@ import pytest
 
 from agent_hub.config import (
     DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    DEFAULT_BACKGROUND_TIMEOUT_SECONDS,
     ConfigError,
     PermissionMode,
     load_settings,
@@ -31,6 +32,7 @@ def test_minimal_env_uses_defaults(env: dict[str, str], tmp_path: Path) -> None:
     assert settings.claude.permission_mode is PermissionMode.DEFAULT
     assert settings.claude.model is None
     assert settings.claude.max_budget_usd is None
+    assert settings.claude.background_timeout_seconds == DEFAULT_BACKGROUND_TIMEOUT_SECONDS
 
 
 def test_optional_values_are_parsed(env: dict[str, str]) -> None:
@@ -39,6 +41,7 @@ def test_optional_values_are_parsed(env: dict[str, str]) -> None:
         "AGENT_HUB_CLAUDE_MODEL": "claude-opus-5-5",
         "AGENT_HUB_CLAUDE_MAX_BUDGET_USD": "2.50",
         "AGENT_HUB_APPROVAL_TIMEOUT_SECONDS": "30",
+        "AGENT_HUB_BACKGROUND_TIMEOUT_SECONDS": "7200",
     }
     settings = load_settings(env)
 
@@ -46,6 +49,7 @@ def test_optional_values_are_parsed(env: dict[str, str]) -> None:
     assert settings.claude.model == "claude-opus-5-5"
     assert settings.claude.max_budget_usd == Decimal("2.50")
     assert settings.approval_timeout_seconds == 30
+    assert settings.claude.background_timeout_seconds == 7200
 
 
 @pytest.mark.parametrize(
@@ -59,6 +63,7 @@ def test_optional_values_are_parsed(env: dict[str, str]) -> None:
         ("AGENT_HUB_CLAUDE_MAX_BUDGET_USD", "-1"),
         ("AGENT_HUB_CLAUDE_MAX_BUDGET_USD", "NaN"),
         ("AGENT_HUB_APPROVAL_TIMEOUT_SECONDS", "0"),
+        ("AGENT_HUB_BACKGROUND_TIMEOUT_SECONDS", "-5"),
     ],
 )
 def test_invalid_values_are_rejected(env: dict[str, str], name: str, value: str) -> None:

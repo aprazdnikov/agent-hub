@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from agent_hub.render import format_finished, split_message, truncate
+from agent_hub.render import format_abandoned, format_finished, split_message, truncate
 
 
 def test_short_text_is_one_chunk() -> None:
@@ -48,3 +48,15 @@ def test_truncate_marks_cut() -> None:
 )
 def test_format_finished(cost: Decimal | None, expected: str) -> None:
     assert format_finished(3, cost) == expected
+
+
+def test_format_finished_mentions_running_background_tasks() -> None:
+    assert format_finished(3, None, background=2) == (
+        "✅ Готово · ходов: 3 · ⏳ в фоне задач: 2, пришлю результат"
+    )
+
+
+def test_format_abandoned_lists_tasks() -> None:
+    assert format_abandoned(("sleep 600", "npm test"), timeout_seconds=1800) == (
+        "⌛ Фоновые задачи не завершились за 30 мин, сессия закрыта:\n• sleep 600\n• npm test"
+    )
