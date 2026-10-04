@@ -14,10 +14,15 @@ services:
       # Paths inside the container; they override host paths from .env.
       AGENT_HUB_WORKSPACE_ROOT: /workspace
       AGENT_HUB_STATE_FILE: /data/topics.json
+      # Codex's own sandbox cannot start inside a container; the container is the sandbox.
+      AGENT_HUB_CODEX_SANDBOX: danger-full-access
+      # Without a sandbox to escape, on-request never asks; untrusted asks per command, like Claude.
+      AGENT_HUB_CODEX_APPROVAL: untrusted
     volumes:
       - ${AGENT_HUB_HOST_WORKSPACE:?set AGENT_HUB_HOST_WORKSPACE in .env to the host directory for /workspace}:/workspace
       - data:/data
       - claude:/home/app/.claude
+      - codex:/home/app/.codex
       # Build caches: a named volume by default, or a host directory (e.g. ~/.m2) to reuse it.
       - ${AGENT_HUB_HOST_M2:-m2}:/home/app/.m2
       - ${AGENT_HUB_HOST_NPM:-npm}:/home/app/.npm
@@ -25,5 +30,6 @@ services:
 volumes:
   data:
   claude:
+  codex:
   m2:
   npm:

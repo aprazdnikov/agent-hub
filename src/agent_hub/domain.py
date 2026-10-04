@@ -11,6 +11,7 @@ SessionId = NewType("SessionId", str)
 
 class BackendKind(StrEnum):
     CLAUDE = "claude"
+    CODEX = "codex"
 
 
 @final
@@ -113,7 +114,7 @@ FileDelivery = Delivered | Denied
 
 
 class ImageMediaType(StrEnum):
-    """Image formats the Claude API accepts inline."""
+    """Image formats every backend accepts inline."""
 
     JPEG = "image/jpeg"
     PNG = "image/png"
@@ -163,12 +164,16 @@ class ToolCall:
 @final
 @dataclass(frozen=True, slots=True)
 class Finished:
-    """One agent turn ended; `background` tasks keep running and report in later turns."""
+    """One agent turn ended; `background` tasks keep running and report in later turns.
+
+    Each backend reports what its agent measures: Claude turns and cost, Codex tokens.
+    """
 
     session_id: SessionId
-    turns: int
+    turns: int | None
     cost_usd: Decimal | None
     background: int = 0
+    tokens: int | None = None
 
 
 @final

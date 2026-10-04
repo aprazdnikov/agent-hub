@@ -1,5 +1,4 @@
 import base64
-from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -16,36 +15,30 @@ from claude_agent_sdk import (
 
 from agent_hub.backends.claude import (
     SEND_FILE_TOOL,
-    TOOL_SUMMARY_LIMIT,
     SessionTracker,
     decide,
-    parse_questions,
     send_file_result,
     summarize_tool_input,
     user_message,
 )
+from agent_hub.backends.common import TOOL_SUMMARY_LIMIT
 from agent_hub.domain import (
     Allowed,
     Answered,
     AssistantText,
-    Decision,
-    Delivered,
     Denied,
     Failed,
-    FileDelivery,
     Finished,
     Image,
     ImageMediaType,
     OutgoingFile,
     Prompt,
-    Question,
-    QuestionOption,
-    QuestionsOutcome,
     SessionId,
     SessionStarted,
     ToolCall,
     ToolRequest,
 )
+from tests.fakes import ASK_INPUT, ASK_QUESTION, FakeChannel
 
 
 def _result(*, is_error: bool, cost: float | None = 0.1234) -> ResultMessage:
@@ -122,90 +115,21 @@ def test_summary_is_truncated() -> None:
     assert len(summary) == TOOL_SUMMARY_LIMIT
 
 
-_ASK_INPUT: dict[str, Any] = {
-    "questions": [
-        {
-            "question": "Какой формат?",
-            "header": "Формат",
-            "options": [
-                {"label": "Кратко", "description": "Только суть"},
-                {"label": "Подробно", "description": "С примерами"},
-            ],
-            "multiSelect": False,
-        }
-    ]
-}
-_ASK_QUESTION = Question(
-    "Какой формат?",
-    "Формат",
-    (QuestionOption("Кратко", "Только суть"), QuestionOption("Подробно", "С примерами")),
-    multi_select=False,
-)
-
-
-DELIVERED = Delivered()
-
-
-class FakeChannel:
-    def __init__(
-        self,
-        decision: Decision,
-        outcome: QuestionsOutcome,
-        delivery: FileDelivery = DELIVERED,
-    ) -> None:
-        self.decision = decision
-        self.outcome = outcome
-        self.delivery = delivery
-        self.requests: list[ToolRequest] = []
-        self.asked: list[Sequence[Question]] = []
-        self.sent: list[OutgoingFile] = []
-
-    async def send_file(self, file: OutgoingFile) -> FileDelivery:
-        self.sent.append(file)
-        return self.delivery
-
-    async def request(self, tool: ToolRequest) -> Decision:
-        self.requests.append(tool)
-        return self.decision
-
-    async def ask(self, questions: Sequence[Question]) -> QuestionsOutcome:
-        self.asked.append(questions)
-        return self.outcome
-
-
-def test_questions_are_parsed() -> None:
-    assert parse_questions(_ASK_INPUT) == (_ASK_QUESTION,)
-
-
-@pytest.mark.parametrize(
-    "tool_input",
-    [
-        {},
-        {"questions": []},
-        {"questions": "x"},
-        {"questions": [{"header": "h", "options": []}]},
-        {"questions": [{"question": "q", "options": [{"description": "no label"}]}]},
-    ],
-)
-def test_malformed_questions_are_rejected(tool_input: dict[str, Any]) -> None:
-    assert parse_questions(tool_input) is None
-
-
 async def test_answered_questions_are_returned_as_tool_input() -> None:
     channel = FakeChannel(Allowed(), Answered((("Какой формат?", "Кратко"),)))
 
-    result = await decide("AskUserQuestion", _ASK_INPUT, channel)
+    result = await decide("AskUserQuestion", ASK_INPUT, channel)
 
-    assert channel.asked == [(_ASK_QUESTION,)]
+    assert channel.asked == [(ASK_QUESTION,)]
     assert channel.requests == []
     assert result == PermissionResultAllow(
-        updated_input={**_ASK_INPUT, "answers": {"Какой формат?": "Кратко"}}
+        updated_input={**ASK_INPUT, "answers": {"Какой формат?": "Кратко"}}
     )
 
 
 async def test_declined_questions_deny_the_tool() -> None:
     channel = FakeChannel(Allowed(), Denied("нет"))
-    result = await decide("AskUserQuestion", _ASK_INPUT, channel)
+    result = await decide("AskUserQuestion", ASK_INPUT, channel)
     assert result == PermissionResultDeny(message="нет")
 
 
@@ -258,7 +182,7 @@ def test_user_message_without_text_has_only_images() -> None:
 
 def test_question_tool_call_is_not_echoed() -> None:
     message = AssistantMessage(
-        content=[ToolUseBlock(id="t1", name="AskUserQuestion", input=_ASK_INPUT)], model="claude"
+        content=[ToolUseBlock(id="t1", name="AskUserQuestion", input=ASK_INPUT)], model="claude"
     )
     assert list(SessionTracker().translate(message)) == []
 

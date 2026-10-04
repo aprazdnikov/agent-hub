@@ -2,19 +2,21 @@
 
 **Каждая тема Telegram-группы — отдельная сессия AI-агента на вашей машине.**
 
-Создали тему «Починить тесты в backend» — получили новую сессию Claude Code. Пишете в тему
+Создали тему «Починить тесты в backend» — получили новую сессию агента. Пишете в тему
 задачу, агент работает в вашей рабочей директории, присылает ответы и спрашивает кнопками
 разрешение на команды и правки. Темы живут параллельно и независимо, контекст каждой
 сохраняется между сообщениями и перезапусками бота.
 
-Сейчас поддерживается один бэкенд — **Claude** (через
-[Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview)). Архитектура
-рассчитана на добавление других агентов — см. [Добавление бэкенда](#добавление-бэкенда).
+Поддерживаются два агента — **Claude** (через
+[Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview)) и **Codex**
+(через `codex app-server`). Агент выбирается для каждой темы: `/new codex <путь>` или
+`/backend codex`. Архитектура рассчитана на добавление других агентов — см.
+[Добавление бэкенда](#добавление-бэкенда).
 
 ```
 Telegram (форум-группа)
   ├─ тема «backend: тесты»   → сессия Claude, cwd ~/Projects/shop/backend
-  ├─ тема «agent-hub»        → сессия Claude, cwd ~/Projects/aprazdnikov/agent-hub
+  ├─ тема «agent-hub»        → сессия Codex,  cwd ~/Projects/aprazdnikov/agent-hub
   └─ тема «идеи»             → сессия Claude, cwd ~/Projects
 ```
 
@@ -41,6 +43,7 @@ Telegram (форум-группа)
 | Linux или macOS | Там, где будет работать агент |
 | [uv](https://docs.astral.sh/uv/) **или** Docker с Compose | Запуск на хосте (Python 3.12+ uv поставит сам) или [в контейнере](#запуск-в-docker) |
 | [Claude Code](https://code.claude.com/docs/en/setup), выполненный вход (`claude` → `/login`) или `ANTHROPIC_API_KEY` | SDK запускает Claude Code и берёт его авторизацию |
+| [Codex](https://developers.openai.com/codex), вход (`codex login`) или `OPENAI_API_KEY` | Только для тем с Codex; бинарник ставится вместе с проектом |
 | Telegram-аккаунт | Создать бота и группу |
 
 ## Быстрый старт
@@ -54,6 +57,7 @@ Telegram (форум-группа)
 
    ```
    new - Новая сессия: /new [backend] [путь]
+   backend - Показать или сменить агента темы
    cwd - Сменить рабочую директорию
    reset - Сбросить контекст разговора
    stop - Прервать текущую задачу
@@ -131,6 +135,7 @@ uv run --env-file .env agent-hub
 | Команда | Что делает |
 |---|---|
 | `/new [backend] [путь]` | Новая сессия в этой теме: сброс контекста, опционально бэкенд и директория |
+| `/backend [claude\|codex]` | Показать или сменить агента темы (контекст сбрасывается) |
 | `/cwd <путь>` | Сменить рабочую директорию (контекст сбрасывается) |
 | `/reset` | Начать разговор заново в той же директории |
 | `/stop` | Прервать выполняющуюся задачу |
@@ -143,6 +148,7 @@ uv run --env-file .env agent-hub
 ```
 /new shop/backend
 /new claude ~/Projects/aprazdnikov/agent-hub
+/backend codex
 /cwd shop/frontend
 ```
 
@@ -242,6 +248,11 @@ uv run pytest tests/test_orders.py
 | `AGENT_HUB_CLAUDE_PERMISSION_MODE` | нет | `default` | Режим разрешений Claude Code, см. ниже |
 | `AGENT_HUB_CLAUDE_MODEL` | нет | из настроек Claude Code | Модель, например `claude-opus-5-5` |
 | `AGENT_HUB_CLAUDE_MAX_BUDGET_USD` | нет | без лимита | Лимит стоимости одной задачи (одного сообщения) |
+| `AGENT_HUB_DEFAULT_BACKEND` | нет | `claude` | Агент новых тем |
+| `AGENT_HUB_CODEX_MODEL` | нет | из настроек Codex | Модель Codex |
+| `AGENT_HUB_CODEX_SANDBOX` | нет | `workspace-write` | Песочница Codex, см. ниже |
+| `AGENT_HUB_CODEX_APPROVAL` | нет | `on-request` (в Docker `untrusted`) | Когда Codex спрашивает разрешение, см. ниже |
+| `OPENAI_API_KEY` | нет | — | Ключ для Codex; при старте сохраняется в `CODEX_HOME`, если входа нет или вход по ключу. Вход по подписке ChatGPT сохраняется — для перехода на ключ `codex logout` |
 
 Режимы разрешений:
 
@@ -252,6 +263,20 @@ uv run pytest tests/test_orders.py
 | `plan` | Только чтение и план, без изменений |
 | `bypassPermissions` | Без подтверждений вообще. Только в изолированном окружении |
 
+Режимы Codex:
+
+| `AGENT_HUB_CODEX_SANDBOX` | Что разрешено командам |
+|---|---|
+| `read-only` | Только чтение |
+| `workspace-write` | Запись в рабочей директории. **Рекомендуется** на хосте |
+| `danger-full-access` | Без ограничений. Только в изолированном окружении (по умолчанию в Docker) |
+
+| `AGENT_HUB_CODEX_APPROVAL` | Когда спрашивает |
+|---|---|
+| `untrusted` | Почти перед каждой командой (по умолчанию в Docker) |
+| `on-request` | Когда нужно выйти за песочницу или модель сочтёт нужным. **Рекомендуется** на хосте; с `danger-full-access` выходить некуда, и команды выполняются без вопросов |
+| `never` | Никогда |
+
 ## Запуск в Docker
 
 Директория хоста монтируется в контейнер как `/workspace` — это и есть корень рабочих
@@ -259,7 +284,7 @@ uv run pytest tests/test_orders.py
 
 | Вариант | Что внутри | Для чего |
 |---|---|---|
-| `base` (по умолчанию) | Python 3.12, git, ssh, curl, Claude Code | Python, скрипты, документация |
+| `base` (по умолчанию) | Python 3.12, git, ssh, curl, Claude Code, Codex | Python, скрипты, документация |
 | `dev` | `base` + JDK 25, Maven 3.9, Node.js 24, npm, Docker CLI | Java/Maven и JavaScript-проекты |
 
 Claude Code поставляется вместе с SDK, отдельный Node.js для него не нужен. Версии
@@ -293,9 +318,9 @@ AGENT_HUB_HOST_M2=/home/you/.m2
 docker compose build
 ```
 
-### 3. Авторизуйте Claude
+### 3. Авторизуйте агентов
 
-Один из вариантов:
+**Claude** — один из вариантов:
 
 - **Вход по подписке внутри контейнера** — выполняется один раз, данные сохраняются в томе
   `claude`:
@@ -308,6 +333,21 @@ docker compose build
 - **API-ключ:** `ANTHROPIC_API_KEY=sk-ant-...` в `.env`.
 - **Долгоживущий токен подписки:** выполните `claude setup-token` на хосте и положите результат
   в `CLAUDE_CODE_OAUTH_TOKEN` в `.env`.
+
+**Codex** — один из вариантов:
+
+- **Вход по подписке ChatGPT** — один раз, данные сохраняются в томе `codex`:
+
+  ```bash
+  docker compose run --rm -it --entrypoint codex agent-hub login --device-auth
+  ```
+
+- **API-ключ:** `OPENAI_API_KEY=sk-...` в `.env`; при старте бот передаёт его Codex, если в томе
+  нет входа по подписке (иначе остаётся подписка — для перехода на ключ выполните `codex logout`).
+
+Без входа темы с Codex отвечают ошибкой, остальное работает; в логе —
+`codex not logged in`. Проверка входа идёт в фоне после старта бота и только если Codex
+используется: бэкенд по умолчанию `codex`, задан `OPENAI_API_KEY` или есть тема с Codex.
 
 ### 4. Запустите
 
@@ -334,6 +374,7 @@ docker compose build && docker compose up -d   # после обновления
 | `/workspace` | `AGENT_HUB_HOST_WORKSPACE` (bind mount) | Ваши проекты, с ними работает агент |
 | `/data` | том `data` | `topics.json` — привязка тем к сессиям |
 | `/home/app/.claude` | том `claude` | Логин, настройки и история сессий Claude Code |
+| `/home/app/.codex` | том `codex` | Логин, настройки и треды Codex |
 | `/home/app/.m2` | `AGENT_HUB_HOST_M2` или том `m2` | Локальный Maven-репозиторий |
 | `/home/app/.npm` | `AGENT_HUB_HOST_NPM` или том `npm` | Кеш npm |
 
@@ -350,7 +391,8 @@ docker compose build && docker compose up -d   # после обновления
 
 > ⚠️ Доступ к Docker-сокету равен правам root на хосте: агент может запустить контейнер,
 > смонтировав в него любую директорию. Включайте, только если нужны такие тесты, и держите
-> `AGENT_HUB_CLAUDE_PERMISSION_MODE=default`, чтобы каждая команда шла через подтверждение.
+> `AGENT_HUB_CLAUDE_PERMISSION_MODE=default` и `AGENT_HUB_CODEX_APPROVAL=untrusted` (по умолчанию в
+> Docker), чтобы каждая команда шла через подтверждение.
 
 Включение — в `.env`:
 
@@ -470,7 +512,12 @@ src/agent_hub/
 ├── logs.py            # формат логов key=value
 └── backends/
     ├── __init__.py    # протоколы AgentBackend и UserChannel
-    └── claude.py      # адаптер Claude Agent SDK
+    ├── common.py      # общие инструменты хаба (send_file, ask_user)
+    ├── claude.py      # адаптер Claude Agent SDK
+    ├── rpc.py         # JSON-RPC поверх stdio
+    ├── codex.py       # бэкенд Codex: процесс app-server и сессия
+    ├── codex_protocol.py  # сообщения app-server ↔ события хаба
+    └── codex_requests.py  # одобрения, инструменты и вопросы Codex
 ```
 
 Сообщение в теме без открытой сессии открывает её:
@@ -482,7 +529,8 @@ src/agent_hub/
    `SessionStarted`, `AssistantText`, `ToolCall`, на каждый ход агента — `Finished` или
    `Failed`. Сессия держится открытой, пока агент занят, есть сообщения в очереди или
    работают фоновые задачи: закрыть CLI — значит убить их. Их результаты приходят ходами,
-   которые CLI начинает сам.
+   которые CLI начинает сам. У Codex фоновых задач нет, а сообщение, присланное во время
+   хода, присоединяется к нему (`turn/steer`).
 3. Запросы разрешений, вопросы агента и файлы от него идут через `UserChannel`: сообщение с
    кнопками и ожидание ответа или отправка документа.
 4. `session_id` сохраняется сразу при старте хода, поэтому даже после падения бота

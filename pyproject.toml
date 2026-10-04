@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.0",
     "markdown-it-py>=3",
+    "openai-codex-cli-bin>=0.160.0",
     "python-telegram-bot>=22.0,<23",
 ]
 
@@ -31,6 +32,7 @@ build-backend = "uv_build"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -74,6 +76,11 @@ enable_error_code = [
     "unimported-reveal",
     "unused-awaitable",
 ]
+
+[[tool.mypy.overrides]]
+# Annotated, but ships without a py.typed marker.
+module = ["codex_cli_bin"]
+follow_untyped_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

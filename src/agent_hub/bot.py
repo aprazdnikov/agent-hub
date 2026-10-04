@@ -3,7 +3,7 @@
 import asyncio
 import html
 import logging
-from collections.abc import Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import timedelta
@@ -49,7 +49,15 @@ from agent_hub.attachments import (
     upload_path,
 )
 from agent_hub.backends import AgentBackend
-from agent_hub.commands import DEFAULT_BACKEND, join_path_args, parse_new_args
+from agent_hub.commands import (
+    AlreadySelected,
+    ShowSession,
+    SwitchBackend,
+    UnknownBackend,
+    decide_backend,
+    join_path_args,
+    parse_new_args,
+)
 from agent_hub.config import Settings
 from agent_hub.domain import (
     AgentEvent,
@@ -108,6 +116,7 @@ HELP = """\
 
 Просто пишите задачу в теме. Команды:
 /new [backend] [путь] — новая сессия в этой теме (сброс контекста)
+/backend [claude|codex] — сменить агента в этой теме (сброс контекста)
 /cwd <путь> — сменить рабочую директорию (сброс контекста)
 /reset — начать разговор заново в той же директории
 /stop — прервать текущую задачу
@@ -330,7 +339,10 @@ class Hub:
         settings: Settings,
         store: TopicStore,
         backends: Mapping[BackendKind, AgentBackend],
+        *,
+        startup: Sequence[Callable[[], Coroutine[Any, Any, None]]] = (),
     ) -> None:
+        self._startup = startup
         self._settings = settings
         self._store = store
         self._backends = backends
@@ -339,14 +351,17 @@ class Hub:
         self._pending = Pending(self._approvals, self._questions)
         self._running: dict[TopicKey, LiveSession] = {}
         self._albums: dict[str, list[Message]] = {}
-        # Unawaited helper tasks (album flushes, attachment downloads), kept to cancel on stop.
+        # Unawaited helper tasks (album flushes, attachment downloads, startup probe),
+        # kept to cancel on stop.
         self._helpers: set[asyncio.Task[None]] = set()
 
     def build_application(self) -> Application[Any, Any, Any, Any, Any, Any]:
         app = (
             Application.builder()
             .token(self._settings.telegram_token)
+            .post_init(self._start_background)
             .post_stop(self._cancel_all)
+            .post_shutdown(self._cancel_all)
             .build()
         )
         # Edits of old messages must not re-run commands or start new turns.
@@ -355,6 +370,7 @@ class Hub:
         app.add_handler(CommandHandler(["start", "help"], self._help, filters=fresh))
         app.add_handler(CommandHandler("new", self._new, filters=fresh))
         app.add_handler(CommandHandler("cwd", self._cwd, filters=fresh))
+        app.add_handler(CommandHandler("backend", self._backend, filters=fresh))
         app.add_handler(CommandHandler("reset", self._reset, filters=fresh))
         app.add_handler(CommandHandler("stop", self._stop, filters=fresh))
         app.add_handler(CommandHandler("status", self._status, filters=fresh))
@@ -402,7 +418,7 @@ class Hub:
         key = _topic_key(update.effective_message)
         if key is None:
             return
-        session = TopicSession(DEFAULT_BACKEND, self._settings.workspace_root, None)
+        session = TopicSession(self._settings.default_backend, self._settings.workspace_root, None)
         self._store.put(key, session)
         log.info("topic bound", extra=_fields(key))
         await TelegramSender(context.bot).text(key, _describe("🆕 Новая сессия", session))
@@ -411,7 +427,7 @@ class Hub:
         key = await self._topic_or_hint(update)
         if key is None or await self._refuse_if_running(key, context.bot):
             return
-        args = parse_new_args(context.args or [])
+        args = parse_new_args(context.args or [], self._settings.default_backend)
         try:
             cwd = resolve_cwd(self._settings.workspace_root, args.cwd)
         except InvalidCwdError as error:
@@ -436,10 +452,32 @@ class Hub:
             await sender.text(key, f"⚠️ {error}")
             return
         current = self._session(key)
-        # Claude sessions are stored per project directory, so a new cwd needs a new session.
+        # Agents tie a session to its directory, so a new cwd needs a new session.
         session = TopicSession(current.backend, cwd, None)
         self._store.put(key, session)
         await sender.text(key, _describe("📁 Директория изменена", session))
+
+    async def _backend(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        key = await self._topic_or_hint(update)
+        if key is None:
+            return
+        sender = TelegramSender(context.bot)
+        decision = decide_backend(context.args or [], self._session(key))
+        match decision:
+            case ShowSession(session):
+                await sender.text(key, _describe("ℹ️ Текущая сессия", session))
+            case UnknownBackend(name):
+                known = ", ".join(kind.value for kind in BackendKind)
+                await sender.text(key, f"⚠️ Неизвестный бэкенд {name}. Доступны: {known}")
+            case AlreadySelected(session):
+                await sender.text(key, _describe("ℹ️ Бэкенд уже выбран", session))
+            case SwitchBackend(session):
+                if await self._refuse_if_running(key, context.bot):
+                    return
+                self._store.put(key, session)
+                await sender.text(key, _describe("🔀 Бэкенд изменён", session))
+            case _:
+                assert_never(decision)
 
     async def _reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         key = await self._topic_or_hint(update)
@@ -672,16 +710,16 @@ class Hub:
                     f"🔧 <b>{html.escape(tool)}</b> <code>{line}</code>",
                     parse_mode=ParseMode.HTML,
                 )
-            case Finished(session_id, turns, cost_usd, background):
+            case Finished(session_id, turns, cost_usd, background, tokens):
                 self._store.put(key, self._session(key).with_session(session_id))
                 log.info(
                     "turn finished",
                     extra={**_fields(key), "turns": turns, "background": background},
                 )
-                await sender.text(key, format_finished(turns, cost_usd, background))
+                await sender.text(key, format_finished(turns, cost_usd, background, tokens))
             case BackgroundAbandoned(tasks):
                 log.warning("background abandoned", extra={**_fields(key), "tasks": len(tasks)})
-                timeout = self._settings.claude.background_timeout_seconds
+                timeout = self._settings.background_timeout_seconds
                 await sender.text(key, format_abandoned(tasks, timeout))
             case Failed(reason):
                 log.warning("turn failed", extra={**_fields(key), "reason": reason})
@@ -695,7 +733,9 @@ class Hub:
         """Session bound to the topic, binding the default one on first use."""
         session = self._store.get(key)
         if session is None:
-            session = TopicSession(DEFAULT_BACKEND, self._settings.workspace_root, None)
+            session = TopicSession(
+                self._settings.default_backend, self._settings.workspace_root, None
+            )
             self._store.put(key, session)
             log.info("topic bound", extra=_fields(key))
         return session
@@ -714,6 +754,10 @@ class Hub:
             key, "⏳ В этой теме уже выполняется задача. /stop — прервать."
         )
         return True
+
+    async def _start_background(self, _: Application[Any, Any, Any, Any, Any, Any]) -> None:
+        for work in self._startup:
+            self._helper(work())
 
     async def _cancel_all(self, _: Application[Any, Any, Any, Any, Any, Any]) -> None:
         tasks = [*(live.task for live in self._running.values()), *self._helpers]

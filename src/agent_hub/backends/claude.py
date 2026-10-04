@@ -34,6 +34,16 @@ from claude_agent_sdk import (
 )
 
 from agent_hub.backends import Inbox, UserChannel
+from agent_hub.backends.common import (
+    SEND_FILE_DESCRIPTION,
+    SEND_FILE_SCHEMA,
+    TOOL_SUMMARY_LIMIT,
+    HubTool,
+    ToolError,
+    ToolSuccess,
+    deliver_file,
+    parse_questions,
+)
 from agent_hub.config import ClaudeSettings, PermissionMode
 from agent_hub.domain import (
     AgentEvent,
@@ -41,14 +51,10 @@ from agent_hub.domain import (
     Answered,
     AssistantText,
     BackgroundAbandoned,
-    Delivered,
     Denied,
     Failed,
     Finished,
-    OutgoingFile,
     Prompt,
-    Question,
-    QuestionOption,
     SessionId,
     SessionStarted,
     ToolCall,
@@ -57,22 +63,9 @@ from agent_hub.domain import (
 )
 from agent_hub.render import truncate
 
-TOOL_SUMMARY_LIMIT = 600
 ASK_USER_QUESTION = "AskUserQuestion"
 HUB_SERVER = "agent-hub"
-SEND_FILE = "send_file"
-SEND_FILE_TOOL = f"mcp__{HUB_SERVER}__{SEND_FILE}"
-_SEND_FILE_DESCRIPTION = (
-    "Send a file to the user in their Telegram chat. The user only sees your text replies, "
-    "so use this whenever they ask for a file or a file is the natural result (a PDF report, "
-    "an archive, an image, a CSV export). `path` is absolute or relative to the working "
-    "directory and must stay inside it; `caption` is optional text shown under the file."
-)
-_SEND_FILE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {"path": {"type": "string"}, "caption": {"type": "string"}},
-    "required": ["path"],
-}
+SEND_FILE_TOOL = f"mcp__{HUB_SERVER}__{HubTool.SEND_FILE}"
 # After a background task reports, the CLI starts a turn of its own within this window.
 SETTLE_SECONDS = 30
 # Tools whose result the user already sees as its own message, not as a tool line.
@@ -83,8 +76,9 @@ SETTING_SOURCES: list[Literal["user", "project", "local"]] = ["user", "project",
 
 
 class ClaudeBackend:
-    def __init__(self, settings: ClaudeSettings) -> None:
+    def __init__(self, settings: ClaudeSettings, background_timeout_seconds: int) -> None:
         self._settings = settings
+        self._background_timeout_seconds = background_timeout_seconds
 
     async def run(
         self, session: TopicSession, prompt: Prompt, channel: UserChannel, inbox: Inbox
@@ -177,7 +171,7 @@ class ClaudeBackend:
             case Phase.BACKGROUND:
                 if current is not None:
                     return current
-                return time.monotonic() + self._settings.background_timeout_seconds
+                return time.monotonic() + self._background_timeout_seconds
             case Phase.SETTLING:
                 return time.monotonic() + SETTLE_SECONDS
             case _:
@@ -312,7 +306,7 @@ async def decide(
 
 
 def _hub_server(channel: UserChannel) -> McpSdkServerConfig:
-    @tool(SEND_FILE, _SEND_FILE_DESCRIPTION, _SEND_FILE_SCHEMA)
+    @tool(HubTool.SEND_FILE, SEND_FILE_DESCRIPTION, SEND_FILE_SCHEMA)
     async def send_file(args: dict[str, Any]) -> dict[str, Any]:
         return await send_file_result(args, channel)
 
@@ -320,62 +314,18 @@ def _hub_server(channel: UserChannel) -> McpSdkServerConfig:
 
 
 async def send_file_result(args: Mapping[str, Any], channel: UserChannel) -> dict[str, Any]:
-    """`send_file` tool body: a failed delivery is a tool error the agent can react to."""
-    path, caption = args.get("path"), args.get("caption", "")
-    if not isinstance(path, str) or not path.strip() or not isinstance(caption, str):
-        return _tool_text("path must be a non-empty string, caption a string", is_error=True)
-    delivery = await channel.send_file(OutgoingFile(path, caption))
-    match delivery:
-        case Delivered():
-            return _tool_text(f"Файл {path} отправлен пользователю", is_error=False)
-        case Denied(reason):
-            return _tool_text(reason, is_error=True)
+    result = await deliver_file(args, channel)
+    match result:
+        case ToolSuccess(text):
+            return _tool_text(text, is_error=False)
+        case ToolError(text):
+            return _tool_text(text, is_error=True)
         case _:
-            assert_never(delivery)
+            assert_never(result)
 
 
 def _tool_text(text: str, *, is_error: bool) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "is_error": is_error}
-
-
-def parse_questions(tool_input: Mapping[str, Any]) -> tuple[Question, ...] | None:
-    """`AskUserQuestion` input → questions; None when it does not match the expected shape."""
-    raw = tool_input.get("questions")
-    if not isinstance(raw, list) or not raw:
-        return None
-    questions: list[Question] = []
-    for item in raw:
-        question = _parse_question(item)
-        if question is None:
-            return None
-        questions.append(question)
-    return tuple(questions)
-
-
-def _parse_question(raw: object) -> Question | None:
-    if not isinstance(raw, dict):
-        return None
-    text, header, options = raw.get("question"), raw.get("header", ""), raw.get("options", [])
-    if not isinstance(text, str) or not text.strip() or not isinstance(header, str):
-        return None
-    if not isinstance(options, list):
-        return None
-    parsed: list[QuestionOption] = []
-    for item in options:
-        option = _parse_option(item)
-        if option is None:
-            return None
-        parsed.append(option)
-    return Question(text, header, tuple(parsed), multi_select=raw.get("multiSelect") is True)
-
-
-def _parse_option(raw: object) -> QuestionOption | None:
-    if not isinstance(raw, dict):
-        return None
-    label, description = raw.get("label"), raw.get("description", "")
-    if not isinstance(label, str) or not label.strip() or not isinstance(description, str):
-        return None
-    return QuestionOption(label, description)
 
 
 def user_message(prompt: Prompt, prompt_id: str) -> dict[str, Any]:

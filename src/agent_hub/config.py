@@ -1,13 +1,17 @@
 """Settings parsed once from environment variables."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import final
 
+from agent_hub.domain import BackendKind
+
 PREFIX = "AGENT_HUB_"
+# Codex's own variable name, so an existing key works without renaming.
+OPENAI_API_KEY = "OPENAI_API_KEY"
 DEFAULT_STATE_FILE = Path("~/.local/state/agent-hub/topics.json")
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 600
 DEFAULT_BACKGROUND_TIMEOUT_SECONDS = 1800
@@ -26,13 +30,37 @@ class PermissionMode(StrEnum):
     BYPASS_PERMISSIONS = "bypassPermissions"
 
 
+class CodexSandbox(StrEnum):
+    """What the OS lets commands started by Codex touch."""
+
+    READ_ONLY = "read-only"
+    WORKSPACE_WRITE = "workspace-write"
+    DANGER_FULL_ACCESS = "danger-full-access"
+
+
+class CodexApproval(StrEnum):
+    """When Codex asks the human before acting."""
+
+    UNTRUSTED = "untrusted"
+    ON_REQUEST = "on-request"
+    NEVER = "never"
+
+
 @final
 @dataclass(frozen=True, slots=True)
 class ClaudeSettings:
     permission_mode: PermissionMode
     model: str | None
     max_budget_usd: Decimal | None
-    background_timeout_seconds: int
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CodexSettings:
+    model: str | None
+    sandbox: CodexSandbox
+    approval: CodexApproval
+    api_key: str | None = field(repr=False)
 
 
 @final
@@ -44,7 +72,10 @@ class Settings:
     workspace_root: Path
     state_file: Path
     approval_timeout_seconds: int
+    background_timeout_seconds: int
+    default_backend: BackendKind
     claude: ClaudeSettings
+    codex: CodexSettings
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
@@ -62,15 +93,22 @@ def load_settings(env: Mapping[str, str]) -> Settings:
             "APPROVAL_TIMEOUT_SECONDS",
             DEFAULT_APPROVAL_TIMEOUT_SECONDS,
         ),
+        background_timeout_seconds=_parse_positive_int(
+            _optional(env, "BACKGROUND_TIMEOUT_SECONDS"),
+            "BACKGROUND_TIMEOUT_SECONDS",
+            DEFAULT_BACKGROUND_TIMEOUT_SECONDS,
+        ),
+        default_backend=_choice(env, "DEFAULT_BACKEND", BackendKind.CLAUDE),
         claude=ClaudeSettings(
-            permission_mode=_parse_permission_mode(_optional(env, "CLAUDE_PERMISSION_MODE")),
+            permission_mode=_choice(env, "CLAUDE_PERMISSION_MODE", PermissionMode.DEFAULT),
             model=_optional(env, "CLAUDE_MODEL"),
             max_budget_usd=_parse_budget(_optional(env, "CLAUDE_MAX_BUDGET_USD")),
-            background_timeout_seconds=_parse_positive_int(
-                _optional(env, "BACKGROUND_TIMEOUT_SECONDS"),
-                "BACKGROUND_TIMEOUT_SECONDS",
-                DEFAULT_BACKGROUND_TIMEOUT_SECONDS,
-            ),
+        ),
+        codex=CodexSettings(
+            model=_optional(env, "CODEX_MODEL"),
+            sandbox=_choice(env, "CODEX_SANDBOX", CodexSandbox.WORKSPACE_WRITE),
+            approval=_choice(env, "CODEX_APPROVAL", CodexApproval.ON_REQUEST),
+            api_key=env.get(OPENAI_API_KEY, "").strip() or None,
         ),
     )
 
@@ -112,16 +150,16 @@ def _parse_user_ids(raw: str) -> frozenset[int]:
     return ids
 
 
-def _parse_permission_mode(raw: str | None) -> PermissionMode:
+def _choice[E: StrEnum](env: Mapping[str, str], name: str, default: E) -> E:
+    raw = _optional(env, name)
     if raw is None:
-        return PermissionMode.DEFAULT
+        return default
+    kind = type(default)
     try:
-        return PermissionMode(raw)
+        return kind(raw)
     except ValueError as error:
-        allowed = ", ".join(mode.value for mode in PermissionMode)
-        raise ConfigError(
-            f"{PREFIX}CLAUDE_PERMISSION_MODE must be one of: {allowed}; got {raw!r}"
-        ) from error
+        allowed = ", ".join(member.value for member in kind)
+        raise ConfigError(f"{PREFIX}{name} must be one of: {allowed}; got {raw!r}") from error
 
 
 def _parse_budget(raw: str | None) -> Decimal | None:

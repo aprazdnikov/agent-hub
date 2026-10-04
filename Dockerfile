@@ -28,7 +28,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 
-# Bot + Claude Code + git: enough for Python and plain-text projects.
+# Bot + Claude Code + Codex + git: enough for Python and plain-text projects.
 FROM python:3.12-slim-bookworm AS base
 # Match the host user so files the agent writes into the mounted workspace keep your ownership.
 ARG UID=1000
@@ -38,14 +38,17 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${GID}" app \
     && useradd --uid "${UID}" --gid "${GID}" --create-home --shell /bin/bash app \
-    && mkdir -p /workspace /data /home/app/.claude /home/app/.m2 /home/app/.npm \
-    && chown app:app /workspace /data /home/app/.claude /home/app/.m2 /home/app/.npm
+    && mkdir -p /workspace /data /home/app/.claude /home/app/.codex /home/app/.m2 /home/app/.npm \
+    && chown app:app /workspace /data /home/app/.claude /home/app/.codex /home/app/.m2 /home/app/.npm
 COPY --from=build --chown=app:app /app/.venv /app/.venv
 # The SDK ships its own Claude Code binary; expose it for `claude /login` inside the container.
 RUN ln -s /app/.venv/lib/python3.12/site-packages/claude_agent_sdk/_bundled/claude /usr/local/bin/claude
+# The codex-cli-bin package ships the Codex binary; expose it for `codex login` inside the container.
+RUN ln -s /app/.venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex /usr/local/bin/codex
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     CLAUDE_CONFIG_DIR=/home/app/.claude \
+    CODEX_HOME=/home/app/.codex \
     AGENT_HUB_WORKSPACE_ROOT=/workspace \
     AGENT_HUB_STATE_FILE=/data/topics.json
 USER app

@@ -27,10 +27,19 @@ def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def format_finished(turns: int, cost_usd: Decimal | None, background: int = 0) -> str:
-    cost = "" if cost_usd is None else f" · ${cost_usd.quantize(Decimal('0.01'))}"
-    pending = f" · ⏳ в фоне задач: {background}, пришлю результат" if background else ""
-    return f"✅ Готово · ходов: {turns}{cost}{pending}"
+def format_finished(
+    turns: int | None, cost_usd: Decimal | None, background: int = 0, tokens: int | None = None
+) -> str:
+    parts = ["✅ Готово"]
+    if turns is not None:
+        parts.append(f"ходов: {turns}")
+    if cost_usd is not None:
+        parts.append(f"${cost_usd.quantize(Decimal('0.01'))}")
+    if tokens is not None:
+        parts.append(f"токенов в сессии: {tokens:_}".replace("_", " "))
+    if background:
+        parts.append(f"⏳ в фоне задач: {background}, пришлю результат")
+    return " · ".join(parts)
 
 
 def format_abandoned(tasks: Sequence[str], timeout_seconds: int) -> str:

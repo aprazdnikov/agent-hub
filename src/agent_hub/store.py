@@ -39,6 +39,9 @@ class TopicStore:
     def get(self, key: TopicKey) -> TopicSession | None:
         return self._topics.get(key)
 
+    def uses(self, backend: BackendKind) -> bool:
+        return any(session.backend is backend for session in self._topics.values())
+
     def put(self, key: TopicKey, session: TopicSession) -> None:
         self._topics[key] = session
         self._flush()

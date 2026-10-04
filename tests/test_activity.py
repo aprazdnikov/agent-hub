@@ -212,7 +212,7 @@ class FakeConversation:
 
 
 def _backend(background_timeout: int = 60) -> ClaudeBackend:
-    return ClaudeBackend(ClaudeSettings(PermissionMode.DEFAULT, None, None, background_timeout))
+    return ClaudeBackend(ClaudeSettings(PermissionMode.DEFAULT, None, None), background_timeout)
 
 
 async def _converse(

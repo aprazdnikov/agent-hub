@@ -60,3 +60,11 @@ def test_format_abandoned_lists_tasks() -> None:
     assert format_abandoned(("sleep 600", "npm test"), timeout_seconds=1800) == (
         "⌛ Фоновые задачи не завершились за 30 мин, сессия закрыта:\n• sleep 600\n• npm test"
     )
+
+
+def test_format_finished_without_turns_shows_tokens() -> None:
+    assert format_finished(None, None, tokens=12345) == "✅ Готово · токенов в сессии: 12 345"
+
+
+def test_format_finished_with_nothing_measured() -> None:
+    assert format_finished(None, None) == "✅ Готово"

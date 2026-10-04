@@ -69,3 +69,15 @@ def test_corrupt_state_is_rejected(tmp_path: Path, content: str) -> None:
     path.write_text(content)
     with pytest.raises(CorruptStateError):
         TopicStore.open(path)
+
+
+def test_uses_reports_backends_present_in_store(tmp_path: Path) -> None:
+    store = TopicStore.open(tmp_path / "topics.json")
+    assert not store.uses(BackendKind.CODEX)
+
+    store.put(TopicKey(1, 2), TopicSession(BackendKind.CLAUDE, tmp_path, None))
+    assert store.uses(BackendKind.CLAUDE)
+    assert not store.uses(BackendKind.CODEX)
+
+    store.put(TopicKey(1, 3), TopicSession(BackendKind.CODEX, tmp_path, None))
+    assert store.uses(BackendKind.CODEX)
