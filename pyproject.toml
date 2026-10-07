@@ -1,16 +1,20 @@
 [project]
 name = "agent-hub"
 version = "0.2.0"
-description = "Telegram forum topics as AI agent sessions"
+description = "[DEPRECATED, use agent-hub-rs] Telegram forum topics as AI agent sessions"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
+classifiers = ["Development Status :: 7 - Inactive"]
 dependencies = [
     "claude-agent-sdk>=0.1.0",
     "markdown-it-py>=3",
     "openai-codex-cli-bin>=0.160.0",
     "python-telegram-bot>=22.0,<23",
 ]
+
+[project.urls]
+Successor = "https://github.com/aprazdnikov/agent-hub-rs"
 
 [project.scripts]
 agent-hub = "agent_hub.__main__:main"
